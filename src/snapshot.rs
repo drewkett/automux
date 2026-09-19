@@ -55,11 +55,11 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
         &format!("#{{session_name}}{SEP}#{{session_attached}}"),
     ])?;
     let windows = tmux::lines(&["list-windows", "-a", "-F", &format!("#{{session_name}}{SEP}#{{window_index}}{SEP}#{{window_name}}{SEP}#{{window_layout}}{SEP}#{{window_active}}")] )?;
-    let panes = tmux::lines(&["list-panes", "-a", "-F", &format!("#{{session_name}}{SEP}#{{window_index}}{SEP}#{{pane_id}}{SEP}#{{pane_index}}{SEP}#{{pane_current_path}}{SEP}#{{pane_current_command}}{SEP}#{{pane_title}}{SEP}#{{pane_active}}")] )?;
+    let panes = tmux::lines(&["list-panes", "-a", "-F", &format!("#{{session_name}}{SEP}#{{window_index}}{SEP}#{{pane_id}}{SEP}#{{pane_index}}{SEP}#{{pane_current_path}}{SEP}#{{pane_current_command}}{SEP}#{{pane_title}}{SEP}#{{pane_active}}{SEP}#{{pane_pid}}")] )?;
 
     let mut by_window: BTreeMap<(String, u32), Vec<Pane>> = BTreeMap::new();
     for row in panes {
-        if row.len() != 8 {
+        if row.len() != 9 {
             continue;
         }
         let pane_id = row[2].trim_start_matches('%').parse::<u64>()?;
@@ -80,7 +80,7 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
                 id: pane_id,
                 index: row[3].parse()?,
                 cwd: row[4].clone(),
-                current_command: row[5].clone(),
+                current_command: resolve_command(&row[5], &row[8]),
                 title: row[6].clone(),
                 active: row[7] == "1",
                 history_file,
@@ -230,6 +230,29 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
         ])?;
     }
     Ok(())
+}
+
+/// Claude Code sets its process title to its version (e.g. `2.1.278`), so tmux
+/// reports that instead of `claude`. Fall back to the pane's child process name.
+fn resolve_command(command: &str, pane_pid: &str) -> String {
+    let version_like = !command.is_empty()
+        && command.contains('.')
+        && command.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if !version_like {
+        return command.to_owned();
+    }
+    std::process::Command::new("ps")
+        .args(["-A", "-o", "ppid=,comm="])
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
+                let (ppid, comm) = line.trim().split_once(char::is_whitespace)?;
+                let name = comm.trim().rsplit('/').next()?;
+                (ppid == pane_pid && name == "claude").then(|| name.to_owned())
+            })
+        })
+        .unwrap_or_else(|| command.to_owned())
 }
 
 fn startup_command(config: &Config, pane: &Pane) -> String {
