@@ -25,7 +25,13 @@ fi
 # Install hooks after restore so reconstruction events cannot overwrite the
 # snapshot that is currently being read.
 save_cmd="run-shell -b '$BIN save --quiet'"
+attach_cmd="run-shell -b '$BIN attach'"
 tmux set-hook -g after-new-session "$save_cmd"
+# Completing a startup restore needs a client. `client-attached` does not fire
+# for the client that creates its own session as the server starts, which is
+# exactly the plain `tmux` case, so watch both. `automux attach` consumes a
+# single pending switch, so firing twice is harmless.
+tmux set-hook -ga after-new-session "$attach_cmd"
 tmux set-hook -g after-new-window "$save_cmd"
 tmux set-hook -g window-unlinked "$save_cmd"
 tmux set-hook -g after-split-window "$save_cmd"
@@ -35,4 +41,4 @@ tmux set-hook -g after-select-layout "$save_cmd"
 # Detach is the closest reliable tmux equivalent to application exit. Force it
 # past the debounce interval so the latest working directories are persisted.
 tmux set-hook -g client-detached "run-shell -b '$BIN save --quiet --force'"
-tmux set-hook -g client-attached "run-shell -b '$BIN event client-attached'"
+tmux set-hook -g client-attached "$attach_cmd"

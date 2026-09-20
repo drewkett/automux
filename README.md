@@ -41,7 +41,11 @@ detach also forces a final snapshot.
 
 tmux distinguishes between its server, sessions, and clients:
 
-- `tmux` creates a new session. If no server is running, it starts one first.
+- `tmux` creates a new session. If no server is running, it starts one first,
+  which loads the plugin and reconstructs the saved sessions. tmux then makes
+  its own empty session for the incoming client, so automux moves the client to
+  the session that was attached when the snapshot was saved and discards the
+  empty one.
 - `tmux attach` (or `tmux a`) connects a new client to an existing session.
 - `prefix + d` detaches the current client but leaves the server and sessions
   running, so reconnect with `tmux a`.
@@ -53,19 +57,13 @@ Restored panes are fresh shells in their saved directories. Automux restores
 the tmux structure and scrollback, but it cannot revive arbitrary processes
 that were running inside the old panes.
 
-If you want one command that attaches when a server is already running and
-starts tmux otherwise, add a separate shell alias rather than replacing the
-`tmux` command itself:
+Plain `tmux` therefore works for both a cold start and a reboot. When multiple
+sessions exist, `tmux attach` picks one arbitrarily; use `tmux list-sessions`
+and `tmux attach -t NAME` to select a specific session.
 
-```sh
-alias ta='tmux attach-session 2>/dev/null || tmux new-session'
-```
-
-Then use `ta` for both normal reattachment and startup after a reboot or clean
-shutdown. When multiple sessions exist, plain `tmux attach` chooses one; use
-`tmux list-sessions` and `tmux attach -t NAME` to select a specific session.
-On startup, automux switches the first client to the session that was attached
-when the snapshot was saved.
+Automux only replaces a session tmux named itself (they are numbered from `0`)
+that holds a single idle shell, and only once per restore, so a session you
+created deliberately is never closed.
 
 Automux records saves, restores, pane launches, client attachment, shutdown,
 and agent hook activity as JSON Lines. Inspect the latest entries with:
@@ -118,12 +116,25 @@ Without it, the adapter falls back to `Session.vim` in the pane's working
 directory. One manual workflow is `:mksession! Session.vim` before exiting.
 Claude and Codex similarly resume the exact saved session ID when hook data is
 available, otherwise falling back to `claude --continue` and
-`codex resume --last`. Resume commands deliberately run only when the saved
-pane's foreground command was the matching executable.
+`codex resume --last`.
+
+Automux does not rely on those hooks alone to keep an association alive. When it
+launches a resume it records the session ID for the new pane itself, so a
+workspace survives repeated restarts even if the agent never reports back.
+Codex does not currently run its `SessionStart` hook when a session is resumed,
+which would otherwise make each Codex resume work exactly once. A recorded
+session is dropped as soon as the pane stops running that agent, checked
+against the process tree rather than `pane_current_command`, which reports the
+wrapper shell for a restored pane.
 
 State defaults to `$XDG_STATE_HOME/automux` or `~/.local/state/automux`. Override
 it with `@automux-state-dir` or `AUTOMUX_STATE_DIR`. The snapshot is written
 atomically; scrollback lives in a separate file per pane.
+
+Scrollback, agent registrations, and Neovim sessions are stored under a
+per-server subdirectory, because every tmux server numbers its panes from `%0`
+and two servers running at once would otherwise overwrite each other's state.
+Directories belonging to servers that have exited are removed on the next save.
 
 ## Current limitations
 

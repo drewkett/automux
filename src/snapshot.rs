@@ -1,4 +1,4 @@
-use crate::{audit, config::Config, integrations, layout, tmux};
+use crate::{audit, config::Config, integrations, layout, process, tmux};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -48,14 +48,19 @@ struct Pane {
 
 pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
     audit::record(config, "save_started", serde_json::json!({"force": force}));
-    fs::create_dir_all(config.state_dir.join("history"))?;
     let path = snapshot_path(config);
     if !force && recently_modified(&path, config.debounce) {
         return Ok(());
     }
 
+    let server = tmux::server_identity().context("could not identify the tmux server")?;
+    integrations::prune_dead_servers(config, &server);
+    let history_dir = integrations::server_dir(config, "history", &server)?;
+    let history_prefix = relative_to(&config.state_dir, &history_dir);
+
     let agents = integrations::registry(config).unwrap_or_default();
     let nvim_panes = integrations::nvim_registry(config).unwrap_or_default();
+    let processes = process::Tree::capture();
     let sessions = tmux::lines(&[
         "list-sessions",
         "-F",
@@ -70,7 +75,7 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
             continue;
         }
         let pane_id = row[2].trim_start_matches('%').parse::<u64>()?;
-        let history_file = format!("history/pane-{pane_id}.ansi");
+        let history_file = format!("{history_prefix}/pane-{pane_id}.ansi");
         let capture = tmux::output(&[
             "capture-pane",
             "-epJ",
@@ -80,21 +85,40 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
             &row[2],
         ])?;
         fs::write(config.state_dir.join(&history_file), capture)?;
-        let current_command = resolve_command(&row[5], &row[8]);
+        let pane_pid = row[8].parse::<u32>().ok();
+        let current_command = resolve_command(&row[5], pane_pid, processes.as_ref());
         // Session hooks provide the authoritative application identity. Tmux
         // may report the wrapper shell rather than the foreground TUI after a
         // restored command, so process-name matching would lose exact IDs on
         // the next save. Registry entries are scoped to this tmux server and
         // removed by SessionEnd hooks.
-        let agent = agents.get(&row[2]).cloned();
+        // Automux also writes these records itself when it launches a resume,
+        // so a registration can outlive the process it describes. Drop one the
+        // pane is demonstrably no longer running; keep it when the process
+        // table is unavailable, since losing an ID is worse than keeping a
+        // stale one.
+        let agent =
+            agents
+                .get(&row[2])
+                .cloned()
+                .filter(|agent| match (processes.as_ref(), pane_pid) {
+                    (Some(tree), Some(pid)) => tree.runs(pid, &agent.agent),
+                    _ => true,
+                });
         let nvim_session = (current_command == "nvim" || nvim_panes.contains(&row[2]))
             .then(|| {
-                config
-                    .state_dir
-                    .join("nvim")
-                    .join(format!("pane-{pane_id}.vim"))
+                let nvim = config.state_dir.join("nvim");
+                let name = format!("pane-{pane_id}.vim");
+                // Prefer this server's own directory, but accept a session
+                // file written by the pre-scoping Neovim plugin.
+                [
+                    nvim.join(tmux::server_key(&server)).join(&name),
+                    nvim.join(&name),
+                ]
+                .into_iter()
+                .find(|path| path.is_file())
             })
-            .filter(|path| path.is_file())
+            .flatten()
             .map(|path| path.display().to_string());
         by_window
             .entry((row[0].clone(), row[1].parse()?))
@@ -204,26 +228,39 @@ pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
         restored += 1;
     }
     if restored > 0 {
-        if let Some(name) = bootstrap {
-            if let Some(preferred) = snapshot
-                .sessions
-                .iter()
-                .find(|session| session.attached && tmux::has_session(&session.name))
-                .or_else(|| {
-                    snapshot
-                        .sessions
-                        .iter()
-                        .find(|session| tmux::has_session(&session.name))
-                })
-            {
-                let _ = tmux::run(&["switch-client", "-t", &preferred.name]);
-                audit::record(
-                    config,
-                    "client_switched",
-                    serde_json::json!({"session": preferred.name}),
-                );
+        let preferred = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.attached && tmux::has_session(&session.name))
+            .or_else(|| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| tmux::has_session(&session.name))
+            })
+            .map(|session| session.name.clone());
+        match bootstrap {
+            Some(name) => {
+                if let Some(preferred) = &preferred {
+                    let _ = tmux::run(&["switch-client", "-t", preferred]);
+                    audit::record(
+                        config,
+                        "client_switched",
+                        serde_json::json!({"session": preferred}),
+                    );
+                }
+                let _ = tmux::run(&["kill-session", "-t", &name]);
             }
-            let _ = tmux::run(&["kill-session", "-t", &name]);
+            // Plain `tmux` loads the plugin while the server is starting up,
+            // before any session or client exists, and only then runs the
+            // implicit `new-session`. There is nothing to switch yet, so the
+            // client would land in that brand new empty session instead of the
+            // restored one. Hand the switch to the `client-attached` hook.
+            None => {
+                if let Some(preferred) = preferred {
+                    write_pending_attach(config, &preferred);
+                }
+            }
         }
     }
     audit::record(
@@ -313,6 +350,9 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
                 &pane.cwd,
                 &startup_command(config, pane),
             ])?;
+            if let Some(session) = exact_resume(config, pane) {
+                let _ = integrations::register_restored_agent(config, *id, session);
+            }
             audit::record(
                 config,
                 "pane_launched",
@@ -342,42 +382,35 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
 
 /// Claude Code sets its process title to its version (e.g. `2.1.278`), so tmux
 /// reports that instead of `claude`. Fall back to the pane's child process name.
-fn resolve_command(command: &str, pane_pid: &str) -> String {
+fn resolve_command(command: &str, pane_pid: Option<u32>, tree: Option<&process::Tree>) -> String {
     let version_like = !command.is_empty()
         && command.contains('.')
         && command.chars().all(|c| c.is_ascii_digit() || c == '.');
     if !version_like {
         return command.to_owned();
     }
-    std::process::Command::new("ps")
-        .args(["-A", "-o", "ppid=,comm="])
-        .output()
-        .ok()
-        .and_then(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .find_map(|line| {
-                    let (ppid, comm) = line.trim().split_once(char::is_whitespace)?;
-                    let name = comm.trim().rsplit('/').next()?;
-                    (ppid == pane_pid && name == "claude").then(|| name.to_owned())
-                })
-        })
-        .unwrap_or_else(|| command.to_owned())
+    match (tree, pane_pid) {
+        (Some(tree), Some(pid)) if tree.runs(pid, "claude") => "claude".to_owned(),
+        _ => command.to_owned(),
+    }
+}
+
+/// The saved agent session a restored pane should be relaunched with, if
+/// resuming that agent is enabled.
+fn exact_resume<'a>(config: &Config, pane: &'a Pane) -> Option<&'a integrations::AgentSession> {
+    let session = pane.agent.as_ref()?;
+    match session.agent.as_str() {
+        "claude" if config.resume_claude => Some(session),
+        "codex" if config.resume_codex => Some(session),
+        _ => None,
+    }
 }
 
 fn startup_command(config: &Config, pane: &Pane) -> String {
-    let exact_resume = pane
-        .agent
-        .as_ref()
-        .and_then(|session| match session.agent.as_str() {
-            "claude" if config.resume_claude => {
-                Some(format!("claude --resume {}", quote(&session.session_id)))
-            }
-            "codex" if config.resume_codex => {
-                Some(format!("codex resume {}", quote(&session.session_id)))
-            }
-            _ => None,
-        });
+    let exact_resume = exact_resume(config, pane).map(|session| match session.agent.as_str() {
+        "codex" => format!("codex resume {}", quote(&session.session_id)),
+        _ => format!("claude --resume {}", quote(&session.session_id)),
+    });
     let nvim_resume = pane.nvim_session.as_ref().and_then(|path| {
         config
             .resume_nvim
@@ -428,6 +461,101 @@ pub fn status(config: &Config) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingAttach {
+    server: String,
+    session: String,
+}
+
+/// Finish a startup restore once a client is actually attached.
+///
+/// Only consumes a switch recorded by this server's own restore, and only
+/// replaces the session tmux auto-created for the incoming client: one it
+/// named itself (tmux numbers them from `0`) holding a single idle shell.
+pub fn attach(config: &Config) -> Result<()> {
+    audit::record(config, "client-attached", serde_json::json!({}));
+    let path = pending_attach_path(config);
+    let Ok(data) = fs::read(&path) else {
+        return Ok(());
+    };
+    let pending: PendingAttach = serde_json::from_slice(&data)?;
+    if tmux::server_identity().as_deref() != Some(pending.server.as_str()) {
+        return Ok(());
+    }
+    // These hooks run detached, so `display-message` would report whichever
+    // session tmux considers current rather than the one the client is in.
+    let Some((client, current)) = first_client()? else {
+        return Ok(());
+    };
+    let skip = if !tmux::has_session(&pending.session) {
+        Some("restored session is gone")
+    } else if current == pending.session {
+        Some("already in the restored session")
+    } else if current.parse::<u32>().is_err() {
+        Some("client is in a session it was given a name")
+    } else if !empty_session(&current) {
+        Some("client's session is in use")
+    } else {
+        None
+    };
+    let _ = fs::remove_file(&path);
+    if let Some(reason) = skip {
+        audit::record(
+            config,
+            "attach_skipped",
+            serde_json::json!({"session": pending.session, "current": current, "reason": reason}),
+        );
+        return Ok(());
+    }
+    tmux::run(&["switch-client", "-c", &client, "-t", &pending.session])?;
+    audit::record(
+        config,
+        "client_switched",
+        serde_json::json!({"session": pending.session, "replaced": current}),
+    );
+    let _ = tmux::run(&["kill-session", "-t", &current]);
+    Ok(())
+}
+
+/// The first attached client and the session it is showing.
+fn first_client() -> Result<Option<(String, String)>> {
+    Ok(tmux::lines(&[
+        "list-clients",
+        "-F",
+        &format!("#{{client_name}}{SEP}#{{client_session}}"),
+    ])?
+    .into_iter()
+    .find(|row| row.len() == 2 && !row[0].is_empty() && !row[1].is_empty())
+    .map(|row| (row[0].clone(), row[1].clone())))
+}
+
+fn write_pending_attach(config: &Config, session: &str) {
+    let Some(server) = tmux::server_identity() else {
+        return;
+    };
+    let pending = PendingAttach {
+        server,
+        session: session.to_owned(),
+    };
+    if let Ok(data) = serde_json::to_vec(&pending) {
+        let _ = fs::write(pending_attach_path(config), data);
+    }
+}
+
+fn pending_attach_path(config: &Config) -> PathBuf {
+    config.state_dir.join("pending-attach.json")
+}
+
+/// `path` expressed relative to `base`, using forward slashes.
+fn relative_to(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn snapshot_path(config: &Config) -> PathBuf {

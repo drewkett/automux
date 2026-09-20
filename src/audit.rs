@@ -17,16 +17,19 @@ fn try_record(config: &Config, event: &str, detail: Value) -> Result<()> {
     let entry = json!({
         "time": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         "event": event,
-        "server": server_identity(),
+        "server": crate::tmux::server_identity(),
         "pane": env::var("TMUX_PANE").ok(),
         "detail": detail,
     });
+    // Several hooks log concurrently. Build the whole line first so the append
+    // is a single write and cannot interleave with another process's entry.
+    let mut line = serde_json::to_vec(&entry)?;
+    line.push(b'\n');
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(config.state_dir.join("automux.log"))?;
-    serde_json::to_writer(&mut file, &entry)?;
-    writeln!(file)?;
+    file.write_all(&line)?;
     Ok(())
 }
 
@@ -37,10 +40,4 @@ pub fn print(config: &Config, lines: usize) -> Result<()> {
         println!("{entry}");
     }
     Ok(())
-}
-
-fn server_identity() -> Option<String> {
-    env::var("TMUX")
-        .ok()
-        .and_then(|value| value.rsplit_once(',').map(|(server, _)| server.to_owned()))
 }

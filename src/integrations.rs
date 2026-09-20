@@ -1,4 +1,4 @@
-use crate::{audit, config::Config};
+use crate::{audit, config::Config, tmux};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -90,15 +90,18 @@ if not pane then
   return
 end
 
-local state = vim.fn.system({{{executable}, "state-dir"}})
+-- Pane IDs restart at %0 in every tmux server, so the state directory is
+-- scoped per server. Ask automux for it rather than recomputing the key here.
+local directory = vim.fn.system({{{executable}, "pane-dir"}})
 if vim.v.shell_error ~= 0 then
   return
 end
-state = vim.trim(state)
-local directory = state .. "/nvim"
+directory = vim.trim(directory)
+if directory == "" then
+  return
+end
 local session = directory .. "/pane-" .. pane .. ".vim"
 local registration = directory .. "/pane-" .. pane .. ".json"
-vim.fn.mkdir(directory, "p")
 
 local server = vim.env.TMUX and vim.env.TMUX:match("^(.*),[^,]+$")
 if server then
@@ -159,16 +162,7 @@ pub fn register_agent(config: &Config, agent: &str, mut input: impl Read) -> Res
         bail!("hook input contained an empty session_id");
     }
 
-    let directory = config.state_dir.join("agents");
-    fs::create_dir_all(&directory)?;
-    atomic_json(
-        &directory.join(format!("pane-{pane_number}.json")),
-        &AgentSession {
-            agent: agent.to_owned(),
-            session_id: hook.session_id.clone(),
-            server,
-        },
-    )?;
+    write_agent(config, &server, pane_number, agent, &hook.session_id)?;
     audit::record(
         config,
         "agent_registered",
@@ -177,16 +171,57 @@ pub fn register_agent(config: &Config, agent: &str, mut input: impl Read) -> Res
     Ok(())
 }
 
+/// Record the agent session a restored pane was launched with.
+///
+/// The agents' own `SessionStart` hooks are the primary source of this
+/// association, but they are outside automux's control: Codex, for example,
+/// does not currently run them when a session is resumed, which silently drops
+/// the session ID from the next snapshot and makes the resume work exactly
+/// once. Automux knows which session it just launched, so it records that
+/// directly; a hook firing afterwards simply overwrites it with the same or
+/// newer value.
+pub fn register_restored_agent(
+    config: &Config,
+    pane_number: u64,
+    session: &AgentSession,
+) -> Result<()> {
+    let Some(server) = tmux::server_identity() else {
+        return Ok(());
+    };
+    write_agent(
+        config,
+        &server,
+        pane_number,
+        &session.agent,
+        &session.session_id,
+    )
+}
+
+fn write_agent(
+    config: &Config,
+    server: &str,
+    pane_number: u64,
+    agent: &str,
+    session_id: &str,
+) -> Result<()> {
+    let directory = server_dir(config, "agents", server)?;
+    atomic_json(
+        &directory.join(format!("pane-{pane_number}.json")),
+        &AgentSession {
+            agent: agent.to_owned(),
+            session_id: session_id.to_owned(),
+            server: server.to_owned(),
+        },
+    )
+}
+
 pub fn unregister_agent(config: &Config, agent: &str, mut input: impl Read) -> Result<()> {
     validate_agent(agent)?;
     let Some((pane_number, server)) = tmux_context()? else {
         return Ok(());
     };
     let hook: HookInput = serde_json::from_reader(&mut input).context("invalid hook input")?;
-    let path = config
-        .state_dir
-        .join("agents")
-        .join(format!("pane-{pane_number}.json"));
+    let path = server_dir(config, "agents", &server)?.join(format!("pane-{pane_number}.json"));
     if !path.exists() {
         return Ok(());
     }
@@ -206,67 +241,117 @@ pub fn unregister_agent(config: &Config, agent: &str, mut input: impl Read) -> R
     Ok(())
 }
 
-pub fn registry(config: &Config) -> Result<BTreeMap<String, AgentSession>> {
-    let directory = config.state_dir.join("agents");
-    let mut registry = BTreeMap::new();
-    if !directory.exists() {
-        return Ok(registry);
+/// Per-server state directory.
+///
+/// tmux reuses pane IDs from `%0` upwards in every new server, so a bare
+/// `pane-N` name is not unique: a second server overwrites, and then deletes,
+/// the first server's registration for the same pane number.
+pub fn server_dir(config: &Config, kind: &str, server: &str) -> Result<PathBuf> {
+    let directory = config.state_dir.join(kind).join(tmux::server_key(server));
+    fs::create_dir_all(&directory)?;
+    // The key is a hash, so the identity has to be stored to prune later.
+    let marker = directory.join("server");
+    if !marker.exists() {
+        fs::write(marker, server)?;
     }
-    let Some(server) = server_identity() else {
-        return Ok(registry);
-    };
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(number) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("pane-"))
-            .and_then(|name| name.strip_suffix(".json"))
-            .and_then(|number| number.parse::<u64>().ok())
-        else {
+    Ok(directory)
+}
+
+/// Remove per-server state left behind by tmux servers that have exited.
+pub fn prune_dead_servers(config: &Config, keep: &str) {
+    let keep = tmux::server_key(keep);
+    for kind in ["agents", "nvim", "history"] {
+        let Ok(entries) = fs::read_dir(config.state_dir.join(kind)) else {
             continue;
         };
-        let session: AgentSession = serde_json::from_slice(&fs::read(entry.path())?)
-            .with_context(|| format!("invalid JSON in {}", entry.path().display()))?;
-        if session.server == server {
-            registry.insert(format!("%{number}"), session);
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() || entry.file_name().to_string_lossy() == keep {
+                continue;
+            }
+            let Ok(identity) = fs::read_to_string(entry.path().join("server")) else {
+                continue;
+            };
+            if !tmux::server_alive(identity.trim()) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
         }
+    }
+}
+
+fn current_server_dir(config: &Config, kind: &str) -> Option<PathBuf> {
+    let server = tmux::server_identity()?;
+    server_dir(config, kind, &server).ok()
+}
+
+fn pane_files(directory: &Path) -> Vec<(u64, PathBuf)> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let number = entry
+                .file_name()
+                .to_str()?
+                .strip_prefix("pane-")?
+                .strip_suffix(".json")?
+                .parse::<u64>()
+                .ok()?;
+            Some((number, entry.path()))
+        })
+        .collect()
+}
+
+pub fn registry(config: &Config) -> Result<BTreeMap<String, AgentSession>> {
+    let mut registry = BTreeMap::new();
+    let Some(directory) = current_server_dir(config, "agents") else {
+        return Ok(registry);
+    };
+    for (number, path) in pane_files(&directory) {
+        let session: AgentSession = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("invalid JSON in {}", path.display()))?;
+        registry.insert(format!("%{number}"), session);
     }
     Ok(registry)
 }
 
+/// Legacy, pre-scoping Neovim registration, written directly into `nvim/`.
 #[derive(Deserialize)]
 struct NvimRegistration {
     server: String,
 }
 
 pub fn nvim_registry(config: &Config) -> Result<BTreeSet<String>> {
-    let directory = config.state_dir.join("nvim");
     let mut registry = BTreeSet::new();
-    if !directory.exists() {
-        return Ok(registry);
-    }
-    let Some(server) = server_identity() else {
+    let Some(server) = tmux::server_identity() else {
         return Ok(registry);
     };
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(number) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("pane-"))
-            .and_then(|name| name.strip_suffix(".json"))
-            .and_then(|number| number.parse::<u64>().ok())
-        else {
-            continue;
+    // A Neovim still running the pre-scoping plugin writes into `nvim/` itself
+    // and tags the file with its server, so honour both layouts until every
+    // instance has been restarted.
+    for (number, path) in pane_files(&config.state_dir.join("nvim")) {
+        let legacy: NvimRegistration = match fs::read(&path) {
+            Ok(data) => match serde_json::from_slice(&data) {
+                Ok(value) => value,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
         };
-        let registration: NvimRegistration = serde_json::from_slice(&fs::read(entry.path())?)
-            .with_context(|| format!("invalid JSON in {}", entry.path().display()))?;
-        if registration.server == server {
+        if legacy.server == server {
             registry.insert(format!("%{number}"));
         }
     }
+    for (number, _) in pane_files(&server_dir(config, "nvim", &server)?) {
+        registry.insert(format!("%{number}"));
+    }
     Ok(registry)
+}
+
+/// Directory the Neovim plugin keeps its per-pane session and registration in.
+pub fn print_pane_dir(config: &Config) -> Result<()> {
+    let server = tmux::server_identity().context("not running inside tmux")?;
+    println!("{}", server_dir(config, "nvim", &server)?.display());
+    Ok(())
 }
 
 fn install_hook(path: &Path, agent: &str, executable: &Path) -> Result<()> {
@@ -443,6 +528,7 @@ mod tests {
         install_neovim_plugin(&path, executable).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), first);
         assert!(first.contains("pane-"));
+        assert!(first.contains("pane-dir"));
         assert!(first.contains("registration"));
         assert!(
             first.contains("'/tmp/automux test/bin'")

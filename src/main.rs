@@ -2,6 +2,7 @@ mod audit;
 mod config;
 mod integrations;
 mod layout;
+mod process;
 mod snapshot;
 mod tmux;
 
@@ -39,6 +40,12 @@ enum Command {
     Status,
     /// Print the resolved state directory (useful to plugin scripts).
     StateDir,
+    /// Print this pane's server-scoped Neovim state directory.
+    #[command(hide = true)]
+    PaneDir,
+    /// Finish a startup restore once a client attaches.
+    #[command(hide = true)]
+    Attach,
     /// Install global integrations for detected Neovim, Claude Code, and Codex.
     InstallHooks,
     /// Print recent structured Automux log entries.
@@ -81,6 +88,8 @@ fn main() -> Result<()> {
             println!("{}", config.state_dir.display());
             Ok(())
         }
+        Command::PaneDir => integrations::print_pane_dir(&config),
+        Command::Attach => snapshot::attach(&config),
         Command::InstallHooks => integrations::install_hooks(),
         Command::Logs { lines } => audit::print(&config, lines),
         Command::Event { event } => {
