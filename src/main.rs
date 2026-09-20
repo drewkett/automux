@@ -1,10 +1,12 @@
 mod config;
+mod integrations;
 mod layout;
 mod snapshot;
 mod tmux;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -34,6 +36,14 @@ enum Command {
     Status,
     /// Print the resolved state directory (useful to plugin scripts).
     StateDir,
+    /// Install global session hooks for detected Claude Code and Codex CLIs.
+    InstallHooks,
+    /// Record the exact agent session associated with the current tmux pane.
+    #[command(hide = true)]
+    RegisterAgent {
+        /// Agent emitting the SessionStart hook: claude or codex.
+        agent: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -46,6 +56,10 @@ fn main() -> Result<()> {
         Command::StateDir => {
             println!("{}", config.state_dir.display());
             Ok(())
+        }
+        Command::InstallHooks => integrations::install_hooks(),
+        Command::RegisterAgent { agent } => {
+            integrations::register_agent(&config, &agent, io::stdin())
         }
     }
 }

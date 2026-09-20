@@ -1,4 +1,4 @@
-use crate::{config::Config, layout, tmux};
+use crate::{config::Config, integrations, layout, tmux};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -40,6 +40,8 @@ struct Pane {
     title: String,
     active: bool,
     history_file: String,
+    #[serde(default)]
+    agent: Option<integrations::AgentSession>,
 }
 
 pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
@@ -49,6 +51,7 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
         return Ok(());
     }
 
+    let agents = integrations::registry(config).unwrap_or_default();
     let sessions = tmux::lines(&[
         "list-sessions",
         "-F",
@@ -73,6 +76,11 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
             &row[2],
         ])?;
         fs::write(config.state_dir.join(&history_file), capture)?;
+        let current_command = resolve_command(&row[5], &row[8]);
+        let agent = agents
+            .get(&row[2])
+            .filter(|session| session.agent == current_command)
+            .cloned();
         by_window
             .entry((row[0].clone(), row[1].parse()?))
             .or_default()
@@ -80,10 +88,11 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
                 id: pane_id,
                 index: row[3].parse()?,
                 cwd: row[4].clone(),
-                current_command: resolve_command(&row[5], &row[8]),
+                current_command,
                 title: row[6].clone(),
                 active: row[7] == "1",
                 history_file,
+                agent,
             });
     }
     let mut by_session: BTreeMap<String, Vec<Window>> = BTreeMap::new();
@@ -246,23 +255,37 @@ fn resolve_command(command: &str, pane_pid: &str) -> String {
         .output()
         .ok()
         .and_then(|out| {
-            String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
-                let (ppid, comm) = line.trim().split_once(char::is_whitespace)?;
-                let name = comm.trim().rsplit('/').next()?;
-                (ppid == pane_pid && name == "claude").then(|| name.to_owned())
-            })
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|line| {
+                    let (ppid, comm) = line.trim().split_once(char::is_whitespace)?;
+                    let name = comm.trim().rsplit('/').next()?;
+                    (ppid == pane_pid && name == "claude").then(|| name.to_owned())
+                })
         })
         .unwrap_or_else(|| command.to_owned())
 }
 
 fn startup_command(config: &Config, pane: &Pane) -> String {
-    let resume = match pane.current_command.as_str() {
+    let exact_resume = pane
+        .agent
+        .as_ref()
+        .and_then(|session| match session.agent.as_str() {
+            "claude" if config.resume_claude => {
+                Some(format!("claude --resume {}", quote(&session.session_id)))
+            }
+            "codex" if config.resume_codex => {
+                Some(format!("codex resume {}", quote(&session.session_id)))
+            }
+            _ => None,
+        });
+    let fallback_resume = match pane.current_command.as_str() {
         "nvim" | "vim" if config.resume_nvim => Some("nvim -S Session.vim"),
         "claude" if config.resume_claude => Some("claude --continue"),
         "codex" if config.resume_codex => Some("codex resume --last"),
         _ => None,
     };
-    let shell = match resume {
+    let shell = match exact_resume.as_deref().or(fallback_resume) {
         Some(command) => format!("{command}; exec \"${{SHELL:-/bin/sh}}\" -l"),
         None => "exec \"${SHELL:-/bin/sh}\" -l".to_owned(),
     };

@@ -81,11 +81,27 @@ set -g @automux-resume-claude on
 set -g @automux-resume-codex on
 ```
 
+For reliable Claude Code and Codex resume, install their global session hooks
+once after building automux:
+
+```sh
+./target/release/automux install-hooks
+```
+
+The command detects which CLIs are present on `PATH`, preserves their existing
+configuration, and can be run repeatedly without adding duplicate hooks. The
+hooks associate each tmux pane with the tool's exact session ID. Codex requires
+reviewing and trusting the newly installed hook with `/hooks` before it runs.
+The corresponding `@automux-resume-claude` or `@automux-resume-codex` option
+must still be enabled. Outside tmux, the hooks do nothing.
+
 The Neovim adapter expects `Session.vim` in the pane's working directory. One
-simple workflow is `:mksession! Session.vim` before exiting. The Claude adapter
-runs `claude --continue`; the Codex adapter runs `codex resume --last`. These
-commands depend on the installed tool version and deliberately run only when
-the saved pane's foreground command was the matching executable.
+simple workflow is `:mksession! Session.vim` before exiting. With hooks
+installed, the Claude and Codex adapters resume the exact saved session ID.
+Without hook data they fall back to `claude --continue` and
+`codex resume --last`. These commands depend on the installed tool version and
+deliberately run only when the saved pane's foreground command was the matching
+executable.
 
 State defaults to `$XDG_STATE_HOME/automux` or `~/.local/state/automux`. Override
 it with `@automux-state-dir` or `AUTOMUX_STATE_DIR`. The snapshot is written
