@@ -5,6 +5,7 @@ mod layout;
 mod process;
 mod snapshot;
 mod tmux;
+mod util;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -93,7 +94,7 @@ fn main() -> Result<()> {
         Command::InstallHooks => integrations::install_hooks(),
         Command::Logs { lines } => audit::print(&config, lines),
         Command::Event { event } => {
-            if !matches!(event.as_str(), "plugin-loaded" | "client-attached") {
+            if !audit::EVENTS.contains(&event.as_str()) {
                 anyhow::bail!("unsupported internal event {event:?}");
             }
             audit::record(&config, &event, serde_json::json!({}));

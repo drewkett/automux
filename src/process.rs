@@ -41,6 +41,41 @@ impl Tree {
         (!commands.is_empty()).then_some(Self { children, commands })
     }
 
+    /// The deepest non-shell descendant of `root`, if there is one.
+    ///
+    /// This is what a pane is really running: the pane process is a shell, and
+    /// a restored pane adds a `sh -lc` wrapper on top, so the interesting
+    /// command is always further down.
+    pub fn deepest_command(&self, root: u32) -> Option<&str> {
+        const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "fish", "dash", "ksh"];
+
+        let mut stack = vec![(root, 0usize)];
+        let mut best: Option<(usize, &str)> = None;
+        let mut seen = 0usize;
+        while let Some((pid, depth)) = stack.pop() {
+            seen += 1;
+            if seen > self.commands.len() + 1 {
+                break;
+            }
+            if let Some(command) = self.commands.get(&pid) {
+                if !SHELLS.contains(&command.as_str())
+                    && best.is_none_or(|(best_depth, _)| depth > best_depth)
+                {
+                    best = Some((depth, command.as_str()));
+                }
+            }
+            if let Some(kids) = self.children.get(&pid) {
+                stack.extend(
+                    kids.iter()
+                        .copied()
+                        .filter(|kid| *kid != pid)
+                        .map(|kid| (kid, depth + 1)),
+                );
+            }
+        }
+        best.map(|(_, command)| command)
+    }
+
     /// Whether `name` is the pane process itself or any of its descendants.
     pub fn runs(&self, root: u32, name: &str) -> bool {
         let mut stack = vec![root];
@@ -84,6 +119,26 @@ mod tests {
         assert!(tree.runs(10, "sh"));
         assert!(!tree.runs(10, "claude"));
         assert!(!tree.runs(11, "sh"));
+    }
+
+    #[test]
+    fn deepest_command_skips_shells() {
+        let nested = tree(&[(10, 1, "sh"), (11, 10, "bash"), (12, 11, "codex")]);
+        assert_eq!(nested.deepest_command(10), Some("codex"));
+
+        // Claude Code reports its version as its process title.
+        let claude = tree(&[(10, 1, "zsh"), (11, 10, "2.1.278")]);
+        assert_eq!(claude.deepest_command(10), Some("2.1.278"));
+
+        // An idle shell has nothing below it.
+        let idle = tree(&[(10, 1, "zsh")]);
+        assert_eq!(idle.deepest_command(10), None);
+    }
+
+    #[test]
+    fn deepest_command_tolerates_a_cycle() {
+        let cyclic = tree(&[(10, 11, "sh"), (11, 10, "bash")]);
+        assert_eq!(cyclic.deepest_command(10), None);
     }
 
     #[test]

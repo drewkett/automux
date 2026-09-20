@@ -1,4 +1,4 @@
-use crate::{audit, config::Config, tmux};
+use crate::{audit, config::Config, tmux, util::atomic_json};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -13,7 +13,6 @@ use std::{
 pub struct AgentSession {
     pub agent: String,
     pub session_id: String,
-    #[serde(default)]
     pub server: String,
 }
 
@@ -315,32 +314,11 @@ pub fn registry(config: &Config) -> Result<BTreeMap<String, AgentSession>> {
     Ok(registry)
 }
 
-/// Legacy, pre-scoping Neovim registration, written directly into `nvim/`.
-#[derive(Deserialize)]
-struct NvimRegistration {
-    server: String,
-}
-
 pub fn nvim_registry(config: &Config) -> Result<BTreeSet<String>> {
     let mut registry = BTreeSet::new();
     let Some(server) = tmux::server_identity() else {
         return Ok(registry);
     };
-    // A Neovim still running the pre-scoping plugin writes into `nvim/` itself
-    // and tags the file with its server, so honour both layouts until every
-    // instance has been restarted.
-    for (number, path) in pane_files(&config.state_dir.join("nvim")) {
-        let legacy: NvimRegistration = match fs::read(&path) {
-            Ok(data) => match serde_json::from_slice(&data) {
-                Ok(value) => value,
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        };
-        if legacy.server == server {
-            registry.insert(format!("%{number}"));
-        }
-    }
     for (number, _) in pane_files(&server_dir(config, "nvim", &server)?) {
         registry.insert(format!("%{number}"));
     }
@@ -410,7 +388,7 @@ fn merge_event_hook(
     groups.retain(|group| !contains_automux_hook(group, action, agent));
     let command = format!(
         "{} {action} {agent}",
-        shell_quote(&executable.display().to_string())
+        crate::util::quote(&executable.display().to_string())
     );
     let mut group = json!({
         "hooks": [{
@@ -454,31 +432,15 @@ fn tmux_context() -> Result<Option<(u64, String)>> {
         .strip_prefix('%')
         .and_then(|value| value.parse::<u64>().ok())
         .context("TMUX_PANE did not contain a valid tmux pane ID")?;
-    let server = server_identity().context("TMUX did not identify the current tmux server")?;
+    let server =
+        tmux::server_identity().context("TMUX did not identify the current tmux server")?;
     Ok(Some((pane_number, server)))
-}
-
-fn server_identity() -> Option<String> {
-    env::var("TMUX")
-        .ok()
-        .and_then(|value| value.rsplit_once(',').map(|(server, _)| server.to_owned()))
 }
 
 fn command_exists(name: &str) -> bool {
     env::var_os("PATH")
         .map(|path| env::split_paths(&path).any(|dir| dir.join(name).is_file()))
         .unwrap_or(false)
-}
-
-fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(tmp, path)?;
-    Ok(())
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]

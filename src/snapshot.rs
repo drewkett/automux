@@ -1,4 +1,9 @@
-use crate::{audit, config::Config, integrations, layout, process, tmux};
+use crate::{
+    audit,
+    config::Config,
+    integrations, layout, process, tmux,
+    util::{atomic_json, quote},
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -48,12 +53,12 @@ struct Pane {
 
 pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
     audit::record(config, "save_started", serde_json::json!({"force": force}));
-    let path = snapshot_path(config);
+    let server = tmux::server_identity().context("could not identify the tmux server")?;
+    let path = snapshot_path(config, &server)?;
     if !force && recently_modified(&path, config.debounce) {
         return Ok(());
     }
 
-    let server = tmux::server_identity().context("could not identify the tmux server")?;
     integrations::prune_dead_servers(config, &server);
     let history_dir = integrations::server_dir(config, "history", &server)?;
     let history_prefix = relative_to(&config.state_dir, &history_dir);
@@ -107,16 +112,12 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
                 });
         let nvim_session = (current_command == "nvim" || nvim_panes.contains(&row[2]))
             .then(|| {
-                let nvim = config.state_dir.join("nvim");
-                let name = format!("pane-{pane_id}.vim");
-                // Prefer this server's own directory, but accept a session
-                // file written by the pre-scoping Neovim plugin.
-                [
-                    nvim.join(tmux::server_key(&server)).join(&name),
-                    nvim.join(&name),
-                ]
-                .into_iter()
-                .find(|path| path.is_file())
+                let path = config
+                    .state_dir
+                    .join("nvim")
+                    .join(tmux::server_key(&server))
+                    .join(format!("pane-{pane_id}.vim"));
+                path.is_file().then_some(path)
             })
             .flatten()
             .map(|path| path.display().to_string());
@@ -165,6 +166,7 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
             .collect(),
     };
     atomic_json(&path, &snapshot)?;
+    prune_history(&history_dir, &snapshot);
     let agent_panes = snapshot
         .sessions
         .iter()
@@ -172,7 +174,7 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
         .flat_map(|window| &window.panes)
         .filter(|pane| pane.agent.is_some())
         .count();
-    let nvim_panes = snapshot
+    let nvim_sessions = snapshot
         .sessions
         .iter()
         .flat_map(|session| &session.windows)
@@ -182,7 +184,7 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
     audit::record(
         config,
         "save_completed",
-        serde_json::json!({"sessions": snapshot.sessions.len(), "agent_panes": agent_panes, "nvim_panes": nvim_panes}),
+        serde_json::json!({"sessions": snapshot.sessions.len(), "agent_panes": agent_panes, "nvim_panes": nvim_sessions}),
     );
     if !quiet {
         println!(
@@ -200,7 +202,8 @@ pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
         "restore_started",
         serde_json::json!({"replace_empty": replace_empty}),
     );
-    let data = fs::read(snapshot_path(config)).context("no automux snapshot found")?;
+    let server = tmux::server_identity().context("could not identify the tmux server")?;
+    let data = fs::read(snapshot_path(config, &server)?).context("no automux snapshot found")?;
     let snapshot: Snapshot = serde_json::from_slice(&data).context("invalid automux snapshot")?;
     if snapshot.version != FORMAT_VERSION {
         bail!("unsupported snapshot version {}", snapshot.version);
@@ -220,12 +223,27 @@ pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
         }
     }
     let mut restored = 0;
+    let mut failed = 0;
     for session in &snapshot.sessions {
         if tmux::has_session(&session.name) {
             continue;
         }
-        restore_session(config, session)?;
-        restored += 1;
+        // One unrestorable session must not cost every session after it.
+        match restore_session(config, session) {
+            Ok(()) => restored += 1,
+            Err(error) => {
+                failed += 1;
+                eprintln!(
+                    "automux: could not restore session {}: {error:#}",
+                    session.name
+                );
+                audit::record(
+                    config,
+                    "restore_failed",
+                    serde_json::json!({"session": session.name, "error": format!("{error:#}")}),
+                );
+            }
+        }
     }
     if restored > 0 {
         let preferred = snapshot
@@ -266,13 +284,24 @@ pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
     audit::record(
         config,
         "restore_completed",
-        serde_json::json!({"restored_sessions": restored}),
+        serde_json::json!({"restored_sessions": restored, "failed_sessions": failed}),
     );
     println!("restored {restored} session(s); existing sessions were left untouched");
+    if failed > 0 {
+        println!("{failed} session(s) could not be restored");
+    }
     Ok(())
 }
 
 fn restore_session(config: &Config, session: &Session) -> Result<()> {
+    restore_session_with(&tmux::Cli, config, session)
+}
+
+fn restore_session_with(
+    server: &impl tmux::Server,
+    config: &Config,
+    session: &Session,
+) -> Result<()> {
     const PLACEHOLDER: &str = "exec sleep 86400";
 
     for (window_number, window) in session.windows.iter().enumerate() {
@@ -281,9 +310,15 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
         };
         let target = format!("{}:{}", session.name, window.index);
         if window_number == 0 {
-            tmux::run(&[
+            // `-P -F` reports the window tmux actually created. The index
+            // depends on the server's `base-index`, so it cannot be assumed to
+            // be `0`, and the window id is also immune to name collisions.
+            let created = server.output(&[
                 "new-session",
                 "-d",
+                "-P",
+                "-F",
+                "#{window_id}\u{1f}#{window_index}",
                 "-s",
                 &session.name,
                 "-n",
@@ -292,12 +327,15 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
                 &first.cwd,
                 PLACEHOLDER,
             ])?;
-            let actual = format!("{}:0", session.name);
-            if window.index != 0 {
-                tmux::run(&["move-window", "-s", &actual, "-t", &target])?;
+            let (window_id, actual_index) = created
+                .trim()
+                .split_once(SEP)
+                .context("tmux did not report the created window")?;
+            if actual_index != window.index.to_string() {
+                server.run(&["move-window", "-s", window_id, "-t", &target])?;
             }
         } else {
-            tmux::run(&[
+            server.run(&[
                 "new-window",
                 "-d",
                 "-t",
@@ -310,7 +348,7 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
             ])?;
         }
         for pane in window.panes.iter().skip(1) {
-            tmux::run(&[
+            server.run(&[
                 "split-window",
                 "-d",
                 "-t",
@@ -320,7 +358,8 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
                 PLACEHOLDER,
             ])?;
         }
-        let ids = tmux::output(&["list-panes", "-t", &target, "-F", "#{pane_id}"])?
+        let ids = server
+            .output(&["list-panes", "-t", &target, "-F", "#{pane_id}"])?
             .lines()
             .filter_map(|s| s.trim_start_matches('%').parse().ok())
             .collect::<Vec<_>>();
@@ -334,14 +373,14 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
         }
         let mapped = layout::remap(&window.layout, &ids)
             .with_context(|| format!("could not remap saved layout for {target}"))?;
-        tmux::run(&["select-layout", "-t", &target, &mapped])?;
+        server.run(&["select-layout", "-t", &target, &mapped])?;
 
         // Full-screen applications must start only after tmux has assigned the
         // pane its final dimensions. In particular, Neovim calculates its
         // internal split sizes while sourcing a session file.
         for (pane, id) in window.panes.iter().zip(&ids) {
             let pane_target = format!("%{id}");
-            tmux::run(&[
+            server.run(&[
                 "respawn-pane",
                 "-k",
                 "-t",
@@ -367,11 +406,11 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
         }
         if let Some(active) = window.panes.iter().find(|p| p.active) {
             let pane_target = format!("{}.{}", target, active.index);
-            let _ = tmux::run(&["select-pane", "-t", &pane_target, "-T", &active.title]);
+            let _ = server.run(&["select-pane", "-t", &pane_target, "-T", &active.title]);
         }
     }
     if let Some(active) = session.windows.iter().find(|w| w.active) {
-        tmux::run(&[
+        server.run(&[
             "select-window",
             "-t",
             &format!("{}:{}", session.name, active.index),
@@ -380,19 +419,32 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
     Ok(())
 }
 
-/// Claude Code sets its process title to its version (e.g. `2.1.278`), so tmux
-/// reports that instead of `claude`. Fall back to the pane's child process name.
+/// What a pane is really running.
+///
+/// `pane_current_command` is only the pane's immediate foreground process, and
+/// it lies in two ways that matter here: a restored pane is wrapped in
+/// `sh -lc`, and Claude Code sets its process title to its version (e.g.
+/// `2.1.278`). The process tree already captured for this save answers both,
+/// so it is the primary source and tmux's answer is the fallback.
 fn resolve_command(command: &str, pane_pid: Option<u32>, tree: Option<&process::Tree>) -> String {
-    let version_like = !command.is_empty()
+    let resolved = match (tree, pane_pid) {
+        (Some(tree), Some(pid)) => tree.deepest_command(pid),
+        _ => None,
+    };
+    match resolved {
+        // A version-like title still has to be named for `startup_command` and
+        // `nvim_session` to recognise it.
+        Some(found) if version_like(found) => "claude".to_owned(),
+        Some(found) => found.to_owned(),
+        None if version_like(command) => "claude".to_owned(),
+        None => command.to_owned(),
+    }
+}
+
+fn version_like(command: &str) -> bool {
+    !command.is_empty()
         && command.contains('.')
-        && command.chars().all(|c| c.is_ascii_digit() || c == '.');
-    if !version_like {
-        return command.to_owned();
-    }
-    match (tree, pane_pid) {
-        (Some(tree), Some(pid)) if tree.runs(pid, "claude") => "claude".to_owned(),
-        _ => command.to_owned(),
-    }
+        && command.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 /// The saved agent session a restored pane should be relaunched with, if
@@ -444,7 +496,8 @@ fn startup_command(config: &Config, pane: &Pane) -> String {
 }
 
 pub fn status(config: &Config) -> Result<()> {
-    let path = snapshot_path(config);
+    let server = tmux::server_identity().context("could not identify the tmux server")?;
+    let path = snapshot_path(config, &server)?;
     let snapshot: Snapshot =
         serde_json::from_slice(&fs::read(&path).context("no automux snapshot found")?)?;
     let windows: usize = snapshot.sessions.iter().map(|s| s.windows.len()).sum();
@@ -467,6 +520,9 @@ pub fn status(config: &Config) -> Result<()> {
 struct PendingAttach {
     server: String,
     session: String,
+    /// When the restore ran; only a session tmux created after this can be the
+    /// throwaway one it made for the incoming client.
+    restored_at: u64,
 }
 
 /// Finish a startup restore once a client is actually attached.
@@ -476,12 +532,15 @@ struct PendingAttach {
 /// named itself (tmux numbers them from `0`) holding a single idle shell.
 pub fn attach(config: &Config) -> Result<()> {
     audit::record(config, "client-attached", serde_json::json!({}));
-    let path = pending_attach_path(config);
+    let Some(server) = tmux::server_identity() else {
+        return Ok(());
+    };
+    let path = pending_attach_path(config, &server);
     let Ok(data) = fs::read(&path) else {
         return Ok(());
     };
     let pending: PendingAttach = serde_json::from_slice(&data)?;
-    if tmux::server_identity().as_deref() != Some(pending.server.as_str()) {
+    if pending.server != server {
         return Ok(());
     }
     // These hooks run detached, so `display-message` would report whichever
@@ -495,6 +554,8 @@ pub fn attach(config: &Config) -> Result<()> {
         Some("already in the restored session")
     } else if current.parse::<u32>().is_err() {
         Some("client is in a session it was given a name")
+    } else if !created_after(&current, pending.restored_at) {
+        Some("client's session predates the restore")
     } else if !empty_session(&current) {
         Some("client's session is in use")
     } else {
@@ -538,14 +599,49 @@ fn write_pending_attach(config: &Config, session: &str) {
     let pending = PendingAttach {
         server,
         session: session.to_owned(),
+        restored_at: now(),
     };
     if let Ok(data) = serde_json::to_vec(&pending) {
-        let _ = fs::write(pending_attach_path(config), data);
+        let _ = fs::write(pending_attach_path(config, &pending.server), data);
     }
 }
 
-fn pending_attach_path(config: &Config) -> PathBuf {
-    config.state_dir.join("pending-attach.json")
+fn pending_attach_path(config: &Config, server: &str) -> PathBuf {
+    config
+        .state_dir
+        .join(format!("pending-attach-{}.json", tmux::socket_key(server)))
+}
+
+/// Delete scrollback captures for panes this server no longer has.
+///
+/// `prune_dead_servers` only reclaims whole directories once a server exits,
+/// so without this a long-lived server keeps the full history of every pane it
+/// ever had.
+fn prune_history(history_dir: &Path, snapshot: &Snapshot) {
+    let live: std::collections::BTreeSet<u64> = snapshot
+        .sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .flat_map(|window| &window.panes)
+        .map(|pane| pane.id)
+        .collect();
+    let Ok(entries) = fs::read_dir(history_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("pane-"))
+            .and_then(|name| name.strip_suffix(".ansi"))
+            .and_then(|id| id.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if !live.contains(&id) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// `path` expressed relative to `base`, using forward slashes.
@@ -558,8 +654,15 @@ fn relative_to(base: &Path, path: &Path) -> String {
         .join("/")
 }
 
-fn snapshot_path(config: &Config) -> PathBuf {
-    config.state_dir.join("snapshot.json")
+/// Where this tmux server keeps its snapshot.
+///
+/// Keyed by socket rather than by full server identity so it survives the
+/// server restart it exists to recover from, while a second server on another
+/// `-L` socket still gets a snapshot of its own instead of clobbering this one.
+fn snapshot_path(config: &Config, server: &str) -> Result<PathBuf> {
+    let directory = config.state_dir.join("snapshots");
+    fs::create_dir_all(&directory)?;
+    Ok(directory.join(format!("{}.json", tmux::socket_key(server))))
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -575,12 +678,6 @@ fn recently_modified(path: &Path, duration: std::time::Duration) -> bool {
         .map(|e| e < duration)
         .unwrap_or(false)
 }
-fn atomic_json(path: &Path, value: &Snapshot) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(tmp, path)?;
-    Ok(())
-}
 fn current_session() -> Option<String> {
     tmux::output(&["display-message", "-p", "#{session_name}"])
         .ok()
@@ -589,15 +686,296 @@ fn current_session() -> Option<String> {
 fn unique_bootstrap_name() -> String {
     format!("__automux_bootstrap_{}", std::process::id())
 }
+/// Whether a session was created at or after `timestamp`.
+///
+/// Missing or unparseable output reads as "no": killing a session the client
+/// was already using is far worse than declining to replace one.
+fn created_after(name: &str, timestamp: u64) -> bool {
+    tmux::output(&["display-message", "-p", "-t", name, "#{session_created}"])
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|created| created >= timestamp)
+        .unwrap_or(false)
+}
+
+/// A session holding nothing but one idle login shell in one window.
 fn empty_session(name: &str) -> bool {
+    let single_window = tmux::output(&["list-windows", "-t", name, "-F", "#{window_id}"])
+        .map(|s| s.lines().count() == 1)
+        .unwrap_or(false);
+    if !single_window {
+        return false;
+    }
+    // Compare against the configured shell rather than a fixed list, so users
+    // of nushell or elvish are not excluded.
+    let shell = tmux::output(&["display-message", "-p", "#{default-shell}"])
+        .ok()
+        .and_then(|value| {
+            Path::new(value.trim())
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
     tmux::output(&["list-panes", "-t", name, "-F", "#{pane_current_command}"])
         .map(|s| {
             s.lines().count() == 1
-                && s.lines()
-                    .all(|c| matches!(c, "bash" | "zsh" | "fish" | "sh"))
+                && s.lines().all(|command| {
+                    matches!(command, "bash" | "zsh" | "fish" | "sh")
+                        || shell.as_deref() == Some(command)
+                })
         })
         .unwrap_or(false)
 }
-fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// A tmux server that records what it is asked to do.
+    ///
+    /// `base_index` is the setting that used to break restore: the window
+    /// `new-session` creates is not necessarily `:0`.
+    struct FakeServer {
+        base_index: u32,
+        /// Simulates tmux failing to create one of the requested panes.
+        lose_a_pane: bool,
+        calls: RefCell<Vec<Vec<String>>>,
+        next_pane: RefCell<u64>,
+        panes: RefCell<Vec<u64>>,
+    }
+
+    impl FakeServer {
+        fn new(base_index: u32) -> Self {
+            Self {
+                base_index,
+                lose_a_pane: false,
+                calls: RefCell::new(Vec::new()),
+                next_pane: RefCell::new(0),
+                panes: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn add_pane(&self) {
+            let mut next = self.next_pane.borrow_mut();
+            self.panes.borrow_mut().push(*next);
+            *next += 1;
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.borrow().clone()
+        }
+
+        fn commands(&self) -> Vec<String> {
+            self.calls()
+                .iter()
+                .map(|call| call[0].clone())
+                .collect::<Vec<_>>()
+        }
+    }
+
+    impl tmux::Server for FakeServer {
+        fn output(&self, args: &[&str]) -> Result<String> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|arg| (*arg).to_owned()).collect());
+            Ok(match args[0] {
+                "new-session" => {
+                    self.panes.borrow_mut().clear();
+                    self.add_pane();
+                    format!("@7{SEP}{}\n", self.base_index)
+                }
+                "new-window" => {
+                    self.panes.borrow_mut().clear();
+                    self.add_pane();
+                    String::new()
+                }
+                "split-window" => {
+                    self.add_pane();
+                    String::new()
+                }
+                "list-panes" => self
+                    .panes
+                    .borrow()
+                    .iter()
+                    .take(self.panes.borrow().len() - usize::from(self.lose_a_pane))
+                    .map(|id| format!("%{id}\n"))
+                    .collect(),
+                _ => String::new(),
+            })
+        }
+    }
+
+    fn config() -> (tempfile::TempDir, Config) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            state_dir: temp.path().to_path_buf(),
+            history_limit: "-".into(),
+            debounce: std::time::Duration::from_secs(5),
+            restore_scrollback: false,
+            resume_nvim: false,
+            resume_claude: false,
+            resume_codex: false,
+        };
+        (temp, config)
+    }
+
+    fn pane(id: u64, index: u32) -> Pane {
+        Pane {
+            id,
+            index,
+            cwd: "/tmp".into(),
+            current_command: "zsh".into(),
+            title: format!("pane {index}"),
+            active: index == 0,
+            history_file: format!("history/k/pane-{id}.ansi"),
+            agent: None,
+            nvim_session: None,
+        }
+    }
+
+    fn session(first_window: u32) -> Session {
+        Session {
+            name: "work".into(),
+            attached: true,
+            windows: vec![
+                Window {
+                    index: first_window,
+                    name: "edit".into(),
+                    layout: "aaaa,80x24,0,0,0".into(),
+                    active: true,
+                    panes: vec![pane(0, 0)],
+                },
+                Window {
+                    index: first_window + 1,
+                    name: "run".into(),
+                    layout: "bbbb,80x24,0,0{40x24,0,0,1,39x24,41,0,2}".into(),
+                    active: false,
+                    panes: vec![pane(1, 0), pane(2, 1)],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn the_first_window_is_moved_by_id_when_base_index_differs() {
+        let (_temp, config) = config();
+        let server = FakeServer::new(1);
+
+        restore_session_with(&server, &config, &session(0)).unwrap();
+
+        // tmux created the window at :1; the snapshot wants it at :0.
+        let move_window = server
+            .calls()
+            .into_iter()
+            .find(|call| call[0] == "move-window")
+            .expect("the window should be moved to its saved index");
+        assert_eq!(move_window, ["move-window", "-s", "@7", "-t", "work:0"]);
+    }
+
+    #[test]
+    fn a_matching_base_index_moves_nothing() {
+        let (_temp, config) = config();
+        let server = FakeServer::new(1);
+
+        restore_session_with(&server, &config, &session(1)).unwrap();
+
+        assert!(!server.commands().contains(&"move-window".to_owned()));
+    }
+
+    #[test]
+    fn windows_and_panes_are_created_in_order() {
+        let (_temp, config) = config();
+        let server = FakeServer::new(0);
+
+        restore_session_with(&server, &config, &session(0)).unwrap();
+
+        assert_eq!(
+            server.commands(),
+            [
+                "new-session",
+                "list-panes",
+                "select-layout",
+                "respawn-pane",
+                "select-pane",
+                "new-window",
+                "split-window",
+                "list-panes",
+                "select-layout",
+                "respawn-pane",
+                "respawn-pane",
+                "select-pane",
+                "select-window",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pane_count_mismatch_is_an_error() {
+        let (_temp, config) = config();
+        let mut server = FakeServer::new(0);
+        server.lose_a_pane = true;
+        let mut session = session(0);
+        session.windows[0].panes.push(pane(3, 1));
+
+        let error = restore_session_with(&server, &config, &session).unwrap_err();
+        assert!(error.to_string().contains("expected 2"), "{error}");
+    }
+
+    #[test]
+    fn startup_command_replays_scrollback_before_the_shell() {
+        let (_temp, mut config) = config();
+        config.restore_scrollback = true;
+        let command = startup_command(&config, &pane(4, 0));
+
+        assert!(command.starts_with("if [ -r "), "{command}");
+        assert!(command.contains("pane-4.ansi"), "{command}");
+        assert!(command.contains("exec sh -lc"), "{command}");
+    }
+
+    #[test]
+    fn resume_commands_honour_the_configuration() {
+        let (_temp, mut config) = config();
+        let mut pane = pane(5, 0);
+        pane.agent = Some(integrations::AgentSession {
+            agent: "codex".into(),
+            session_id: "abc'123".into(),
+            server: "/tmp/sock,1".into(),
+        });
+
+        assert!(!startup_command(&config, &pane).contains("codex resume"));
+
+        config.resume_codex = true;
+        let command = startup_command(&config, &pane);
+        assert!(command.contains("codex resume"), "{command}");
+        // The session ID is quoted, so an embedded quote cannot break out.
+        assert!(!command.contains("abc'123"), "{command}");
+    }
+
+    #[test]
+    fn resolve_command_prefers_the_process_tree() {
+        assert_eq!(resolve_command("sh", None, None), "sh");
+        assert_eq!(resolve_command("2.1.278", None, None), "claude");
+    }
+
+    #[test]
+    fn stale_scrollback_files_are_removed() {
+        let (temp, _config) = config();
+        let history = temp.path().join("history");
+        fs::create_dir_all(&history).unwrap();
+        for name in ["pane-0.ansi", "pane-9.ansi", "notes.txt"] {
+            fs::write(history.join(name), "x").unwrap();
+        }
+
+        let snapshot = Snapshot {
+            version: FORMAT_VERSION,
+            saved_at: 0,
+            sessions: vec![session(0)],
+        };
+        prune_history(&history, &snapshot);
+
+        assert!(history.join("pane-0.ansi").exists());
+        assert!(!history.join("pane-9.ansi").exists());
+        // Anything automux did not write is left alone.
+        assert!(history.join("notes.txt").exists());
+    }
 }
