@@ -185,12 +185,13 @@ pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
 }
 
 fn restore_session(config: &Config, session: &Session) -> Result<()> {
+    const PLACEHOLDER: &str = "exec sleep 86400";
+
     for (window_number, window) in session.windows.iter().enumerate() {
         let Some(first) = window.panes.first() else {
             continue;
         };
         let target = format!("{}:{}", session.name, window.index);
-        let command = startup_command(config, first);
         if window_number == 0 {
             tmux::run(&[
                 "new-session",
@@ -201,7 +202,7 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
                 &window.name,
                 "-c",
                 &first.cwd,
-                &command,
+                PLACEHOLDER,
             ])?;
             let actual = format!("{}:0", session.name);
             if window.index != 0 {
@@ -217,7 +218,7 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
                 &window.name,
                 "-c",
                 &first.cwd,
-                &command,
+                PLACEHOLDER,
             ])?;
         }
         for pane in window.panes.iter().skip(1) {
@@ -228,15 +229,39 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
                 &target,
                 "-c",
                 &pane.cwd,
-                &startup_command(config, pane),
+                PLACEHOLDER,
             ])?;
         }
         let ids = tmux::output(&["list-panes", "-t", &target, "-F", "#{pane_id}"])?
             .lines()
             .filter_map(|s| s.trim_start_matches('%').parse().ok())
             .collect::<Vec<_>>();
-        if let Some(mapped) = layout::remap(&window.layout, &ids) {
-            let _ = tmux::run(&["select-layout", "-t", &target, &mapped]);
+        if ids.len() != window.panes.len() {
+            bail!(
+                "created {} pane(s) for {}, expected {}",
+                ids.len(),
+                target,
+                window.panes.len()
+            );
+        }
+        let mapped = layout::remap(&window.layout, &ids)
+            .with_context(|| format!("could not remap saved layout for {target}"))?;
+        tmux::run(&["select-layout", "-t", &target, &mapped])?;
+
+        // Full-screen applications must start only after tmux has assigned the
+        // pane its final dimensions. In particular, Neovim calculates its
+        // internal split sizes while sourcing a session file.
+        for (pane, id) in window.panes.iter().zip(&ids) {
+            let pane_target = format!("%{id}");
+            tmux::run(&[
+                "respawn-pane",
+                "-k",
+                "-t",
+                &pane_target,
+                "-c",
+                &pane.cwd,
+                &startup_command(config, pane),
+            ])?;
         }
         if let Some(active) = window.panes.iter().find(|p| p.active) {
             let pane_target = format!("{}.{}", target, active.index);
