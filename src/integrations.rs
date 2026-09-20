@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     io::Read,
     path::{Path, PathBuf},
@@ -97,7 +97,15 @@ end
 state = vim.trim(state)
 local directory = state .. "/nvim"
 local session = directory .. "/pane-" .. pane .. ".vim"
+local registration = directory .. "/pane-" .. pane .. ".json"
 vim.fn.mkdir(directory, "p")
+
+local server = vim.env.TMUX and vim.env.TMUX:match("^(.*),[^,]+$")
+if server then
+  local temporary = registration .. ".tmp"
+  vim.fn.writefile({{ vim.json.encode({{ server = server }}) }}, temporary)
+  os.rename(temporary, registration)
+end
 
 local pending = false
 local function save_session()
@@ -127,6 +135,12 @@ vim.api.nvim_create_autocmd("VimLeavePre", {{
     local temporary = session .. ".tmp"
     vim.cmd("silent! mksession! " .. vim.fn.fnameescape(temporary))
     os.rename(temporary, session)
+    if server and vim.fn.filereadable(registration) == 1 then
+      local registered = vim.json.decode(table.concat(vim.fn.readfile(registration), "\n"))
+      if registered.server == server then
+        os.remove(registration)
+      end
+    end
   end,
 }})
 "#
@@ -210,6 +224,40 @@ pub fn registry(config: &Config) -> Result<BTreeMap<String, AgentSession>> {
     Ok(registry)
 }
 
+#[derive(Deserialize)]
+struct NvimRegistration {
+    server: String,
+}
+
+pub fn nvim_registry(config: &Config) -> Result<BTreeSet<String>> {
+    let directory = config.state_dir.join("nvim");
+    let mut registry = BTreeSet::new();
+    if !directory.exists() {
+        return Ok(registry);
+    }
+    let Some(server) = server_identity() else {
+        return Ok(registry);
+    };
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(number) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("pane-"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|number| number.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let registration: NvimRegistration = serde_json::from_slice(&fs::read(entry.path())?)
+            .with_context(|| format!("invalid JSON in {}", entry.path().display()))?;
+        if registration.server == server {
+            registry.insert(format!("%{number}"));
+        }
+    }
+    Ok(registry)
+}
+
 fn install_hook(path: &Path, agent: &str, executable: &Path) -> Result<()> {
     let mut root: Value = if path.exists() {
         serde_json::from_slice(&fs::read(path)?)
@@ -272,7 +320,7 @@ fn merge_event_hook(
         "hooks": [{
             "type": "command",
             "command": command,
-            "timeout": 5
+            "timeout": if event == "SessionEnd" { 3 } else { 5 }
         }]
     });
     if let Some(matcher) = matcher {
@@ -384,6 +432,7 @@ mod tests {
         install_neovim_plugin(&path, executable).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), first);
         assert!(first.contains("pane-"));
+        assert!(first.contains("registration"));
         assert!(
             first.contains("'/tmp/automux test/bin'")
                 || first.contains("\"/tmp/automux test/bin\"")

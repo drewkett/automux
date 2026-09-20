@@ -54,6 +54,7 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
     }
 
     let agents = integrations::registry(config).unwrap_or_default();
+    let nvim_panes = integrations::nvim_registry(config).unwrap_or_default();
     let sessions = tmux::lines(&[
         "list-sessions",
         "-F",
@@ -85,7 +86,7 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
         // the next save. Registry entries are scoped to this tmux server and
         // removed by SessionEnd hooks.
         let agent = agents.get(&row[2]).cloned();
-        let nvim_session = (current_command == "nvim")
+        let nvim_session = (current_command == "nvim" || nvim_panes.contains(&row[2]))
             .then(|| {
                 config
                     .state_dir
