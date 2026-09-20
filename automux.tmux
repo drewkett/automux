@@ -25,10 +25,11 @@ fi
 save_cmd="run-shell -b '$BIN save --quiet'"
 tmux set-hook -g after-new-session "$save_cmd"
 tmux set-hook -g after-new-window "$save_cmd"
-tmux set-hook -g after-kill-window "$save_cmd"
+tmux set-hook -g window-unlinked "$save_cmd"
 tmux set-hook -g after-split-window "$save_cmd"
-tmux set-hook -g pane-exited "$save_cmd"
-tmux set-hook -g window-layout-changed "$save_cmd"
+tmux set-hook -g after-kill-pane "$save_cmd"
+tmux set-hook -g after-resize-pane "$save_cmd"
+tmux set-hook -g after-select-layout "$save_cmd"
 # Detach is the closest reliable tmux equivalent to application exit. Force it
 # past the debounce interval so the latest working directories are persisted.
 tmux set-hook -g client-detached "run-shell -b '$BIN save --quiet --force'"
