@@ -44,6 +44,12 @@ enum Command {
         /// Agent emitting the SessionStart hook: claude or codex.
         agent: String,
     },
+    /// Remove an agent registration when its session ends.
+    #[command(hide = true)]
+    UnregisterAgent {
+        /// Agent emitting the SessionEnd hook: claude or codex.
+        agent: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -60,6 +66,9 @@ fn main() -> Result<()> {
         Command::InstallHooks => integrations::install_hooks(),
         Command::RegisterAgent { agent } => {
             integrations::register_agent(&config, &agent, io::stdin())
+        }
+        Command::UnregisterAgent { agent } => {
+            integrations::unregister_agent(&config, &agent, io::stdin())
         }
     }
 }

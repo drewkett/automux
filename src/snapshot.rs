@@ -79,10 +79,12 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
         ])?;
         fs::write(config.state_dir.join(&history_file), capture)?;
         let current_command = resolve_command(&row[5], &row[8]);
-        let agent = agents
-            .get(&row[2])
-            .filter(|session| session.agent == current_command)
-            .cloned();
+        // Session hooks provide the authoritative application identity. Tmux
+        // may report the wrapper shell rather than the foreground TUI after a
+        // restored command, so process-name matching would lose exact IDs on
+        // the next save. Registry entries are scoped to this tmux server and
+        // removed by SessionEnd hooks.
+        let agent = agents.get(&row[2]).cloned();
         let nvim_session = (current_command == "nvim")
             .then(|| {
                 config

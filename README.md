@@ -93,8 +93,10 @@ Claude and Codex configuration, and can be run repeatedly without adding
 duplicate hooks. For Neovim it installs a small global plugin at
 `~/.config/nvim/plugin/automux.lua` (or under `$XDG_CONFIG_HOME`) that maintains
 a session file for each tmux pane. The Claude and Codex hooks associate each
-pane with the tool's exact session ID. Codex requires reviewing and trusting
-the newly installed hook with `/hooks` before it runs. The corresponding
+pane with the tool's exact session ID and remove that association when the
+session ends. Registrations are scoped to the current tmux server so reused
+pane IDs cannot pick up stale sessions. Codex requires reviewing and trusting
+the newly installed hooks with `/hooks` before they run. The corresponding
 `@automux-resume-*` option must still be enabled. Outside tmux, the integrations
 do nothing.
 

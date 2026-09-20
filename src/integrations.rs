@@ -13,6 +13,8 @@ use std::{
 pub struct AgentSession {
     pub agent: String,
     pub session_id: String,
+    #[serde(default)]
+    pub server: String,
 }
 
 #[derive(Deserialize)]
@@ -134,17 +136,10 @@ vim.api.nvim_create_autocmd("VimLeavePre", {{
 }
 
 pub fn register_agent(config: &Config, agent: &str, mut input: impl Read) -> Result<()> {
-    if !matches!(agent, "claude" | "codex") {
-        bail!("unsupported agent {agent:?}; expected claude or codex");
-    }
-    let Some(pane) = env::var_os("TMUX_PANE") else {
+    validate_agent(agent)?;
+    let Some((pane_number, server)) = tmux_context()? else {
         return Ok(());
     };
-    let pane = pane.to_string_lossy();
-    let pane_number = pane
-        .strip_prefix('%')
-        .and_then(|value| value.parse::<u64>().ok())
-        .context("TMUX_PANE did not contain a valid tmux pane ID")?;
     let hook: HookInput = serde_json::from_reader(&mut input).context("invalid hook input")?;
     if hook.session_id.trim().is_empty() {
         bail!("hook input contained an empty session_id");
@@ -157,8 +152,33 @@ pub fn register_agent(config: &Config, agent: &str, mut input: impl Read) -> Res
         &AgentSession {
             agent: agent.to_owned(),
             session_id: hook.session_id,
+            server,
         },
     )
+}
+
+pub fn unregister_agent(config: &Config, agent: &str, mut input: impl Read) -> Result<()> {
+    validate_agent(agent)?;
+    let Some((pane_number, server)) = tmux_context()? else {
+        return Ok(());
+    };
+    let hook: HookInput = serde_json::from_reader(&mut input).context("invalid hook input")?;
+    let path = config
+        .state_dir
+        .join("agents")
+        .join(format!("pane-{pane_number}.json"));
+    if !path.exists() {
+        return Ok(());
+    }
+    let registered: AgentSession = serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
+    if registered.agent == agent
+        && registered.session_id == hook.session_id
+        && registered.server == server
+    {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 pub fn registry(config: &Config) -> Result<BTreeMap<String, AgentSession>> {
@@ -167,6 +187,9 @@ pub fn registry(config: &Config) -> Result<BTreeMap<String, AgentSession>> {
     if !directory.exists() {
         return Ok(registry);
     }
+    let Some(server) = server_identity() else {
+        return Ok(registry);
+    };
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -178,9 +201,11 @@ pub fn registry(config: &Config) -> Result<BTreeMap<String, AgentSession>> {
         else {
             continue;
         };
-        let session = serde_json::from_slice(&fs::read(entry.path())?)
+        let session: AgentSession = serde_json::from_slice(&fs::read(entry.path())?)
             .with_context(|| format!("invalid JSON in {}", entry.path().display()))?;
-        registry.insert(format!("%{number}"), session);
+        if session.server == server {
+            registry.insert(format!("%{number}"), session);
+        }
     }
     Ok(registry)
 }
@@ -207,28 +232,57 @@ fn merge_hook(root: &mut Value, agent: &str, executable: &Path) -> Result<()> {
     let hooks = hooks
         .as_object_mut()
         .context("the hooks setting must be an object")?;
-    let starts = hooks.entry("SessionStart").or_insert_with(|| json!([]));
-    let starts = starts
-        .as_array_mut()
-        .context("hooks.SessionStart must be an array")?;
+    merge_event_hook(
+        hooks,
+        "SessionStart",
+        Some("startup|resume|clear|fork"),
+        "register-agent",
+        agent,
+        executable,
+    )?;
+    merge_event_hook(
+        hooks,
+        "SessionEnd",
+        None,
+        "unregister-agent",
+        agent,
+        executable,
+    )?;
+    Ok(())
+}
 
-    starts.retain(|group| !contains_automux_hook(group, agent));
+fn merge_event_hook(
+    hooks: &mut serde_json::Map<String, Value>,
+    event: &str,
+    matcher: Option<&str>,
+    action: &str,
+    agent: &str,
+    executable: &Path,
+) -> Result<()> {
+    let groups = hooks.entry(event).or_insert_with(|| json!([]));
+    let groups = groups
+        .as_array_mut()
+        .with_context(|| format!("hooks.{event} must be an array"))?;
+    groups.retain(|group| !contains_automux_hook(group, action, agent));
     let command = format!(
-        "{} register-agent {agent}",
+        "{} {action} {agent}",
         shell_quote(&executable.display().to_string())
     );
-    starts.push(json!({
-        "matcher": "startup|resume|clear|fork",
+    let mut group = json!({
         "hooks": [{
             "type": "command",
             "command": command,
             "timeout": 5
         }]
-    }));
+    });
+    if let Some(matcher) = matcher {
+        group["matcher"] = Value::String(matcher.to_owned());
+    }
+    groups.push(group);
     Ok(())
 }
 
-fn contains_automux_hook(group: &Value, agent: &str) -> bool {
+fn contains_automux_hook(group: &Value, action: &str, agent: &str) -> bool {
     group
         .get("hooks")
         .and_then(Value::as_array)
@@ -236,10 +290,34 @@ fn contains_automux_hook(group: &Value, agent: &str) -> bool {
         .flatten()
         .filter_map(|hook| hook.get("command").and_then(Value::as_str))
         .any(|command| {
-            command.contains("automux")
-                && command.contains("register-agent")
-                && command.ends_with(agent)
+            command.contains("automux") && command.contains(action) && command.ends_with(agent)
         })
+}
+
+fn validate_agent(agent: &str) -> Result<()> {
+    if !matches!(agent, "claude" | "codex") {
+        bail!("unsupported agent {agent:?}; expected claude or codex");
+    }
+    Ok(())
+}
+
+fn tmux_context() -> Result<Option<(u64, String)>> {
+    let Some(pane) = env::var_os("TMUX_PANE") else {
+        return Ok(None);
+    };
+    let pane_number = pane
+        .to_string_lossy()
+        .strip_prefix('%')
+        .and_then(|value| value.parse::<u64>().ok())
+        .context("TMUX_PANE did not contain a valid tmux pane ID")?;
+    let server = server_identity().context("TMUX did not identify the current tmux server")?;
+    Ok(Some((pane_number, server)))
+}
+
+fn server_identity() -> Option<String> {
+    env::var("TMUX")
+        .ok()
+        .and_then(|value| value.rsplit_once(',').map(|(server, _)| server.to_owned()))
 }
 
 fn command_exists(name: &str) -> bool {
@@ -286,6 +364,12 @@ mod tests {
         assert_eq!(
             starts[1]["hooks"][0]["command"],
             "'/tmp/automux test/bin' register-agent claude"
+        );
+        let ends = value["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(
+            ends[0]["hooks"][0]["command"],
+            "'/tmp/automux test/bin' unregister-agent claude"
         );
     }
 
