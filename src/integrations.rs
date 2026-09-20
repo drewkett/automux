@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::{audit, config::Config};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -165,10 +165,16 @@ pub fn register_agent(config: &Config, agent: &str, mut input: impl Read) -> Res
         &directory.join(format!("pane-{pane_number}.json")),
         &AgentSession {
             agent: agent.to_owned(),
-            session_id: hook.session_id,
+            session_id: hook.session_id.clone(),
             server,
         },
-    )
+    )?;
+    audit::record(
+        config,
+        "agent_registered",
+        json!({"agent": agent, "session_id": hook.session_id, "pane": format!("%{pane_number}")}),
+    );
+    Ok(())
 }
 
 pub fn unregister_agent(config: &Config, agent: &str, mut input: impl Read) -> Result<()> {
@@ -191,6 +197,11 @@ pub fn unregister_agent(config: &Config, agent: &str, mut input: impl Read) -> R
         && registered.server == server
     {
         fs::remove_file(path)?;
+        audit::record(
+            config,
+            "agent_unregistered",
+            json!({"agent": agent, "session_id": hook.session_id, "pane": format!("%{pane_number}")}),
+        );
     }
     Ok(())
 }

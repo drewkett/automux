@@ -13,7 +13,9 @@ tmux bind-key S run-shell -b "$BIN save --force"
 tmux bind-key R run-shell -b "$BIN restore"
 # Explicit clean shutdown: save synchronously before stopping the server.
 tmux bind-key X confirm-before -p "Save workspace and stop tmux? (y/n)" \
-  "run-shell '$BIN save --force' ; kill-server"
+  "run-shell '$BIN shutdown'"
+
+"$BIN" event plugin-loaded >/dev/null 2>&1 || true
 
 auto_restore="$(tmux show-option -gqv @automux-auto-restore)"
 if [[ "${auto_restore:-on}" == "on" ]]; then
@@ -33,3 +35,4 @@ tmux set-hook -g after-select-layout "$save_cmd"
 # Detach is the closest reliable tmux equivalent to application exit. Force it
 # past the debounce interval so the latest working directories are persisted.
 tmux set-hook -g client-detached "run-shell -b '$BIN save --quiet --force'"
+tmux set-hook -g client-attached "run-shell -b '$BIN event client-attached'"

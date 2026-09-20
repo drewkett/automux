@@ -64,6 +64,19 @@ alias ta='tmux attach-session 2>/dev/null || tmux new-session'
 Then use `ta` for both normal reattachment and startup after a reboot or clean
 shutdown. When multiple sessions exist, plain `tmux attach` chooses one; use
 `tmux list-sessions` and `tmux attach -t NAME` to select a specific session.
+On startup, automux switches the first client to the session that was attached
+when the snapshot was saved.
+
+Automux records saves, restores, pane launches, client attachment, shutdown,
+and agent hook activity as JSON Lines. Inspect the latest entries with:
+
+```sh
+automux logs
+automux logs -n 25
+```
+
+The log is stored at `$XDG_STATE_HOME/automux/automux.log` or
+`~/.local/state/automux/automux.log`.
 
 ## Configuration
 

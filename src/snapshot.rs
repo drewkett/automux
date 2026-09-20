@@ -1,4 +1,4 @@
-use crate::{config::Config, integrations, layout, tmux};
+use crate::{audit, config::Config, integrations, layout, tmux};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -47,6 +47,7 @@ struct Pane {
 }
 
 pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
+    audit::record(config, "save_started", serde_json::json!({"force": force}));
     fs::create_dir_all(config.state_dir.join("history"))?;
     let path = snapshot_path(config);
     if !force && recently_modified(&path, config.debounce) {
@@ -140,6 +141,25 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
             .collect(),
     };
     atomic_json(&path, &snapshot)?;
+    let agent_panes = snapshot
+        .sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .flat_map(|window| &window.panes)
+        .filter(|pane| pane.agent.is_some())
+        .count();
+    let nvim_panes = snapshot
+        .sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .flat_map(|window| &window.panes)
+        .filter(|pane| pane.nvim_session.is_some())
+        .count();
+    audit::record(
+        config,
+        "save_completed",
+        serde_json::json!({"sessions": snapshot.sessions.len(), "agent_panes": agent_panes, "nvim_panes": nvim_panes}),
+    );
     if !quiet {
         println!(
             "saved {} session(s) to {}",
@@ -151,6 +171,11 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
 }
 
 pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
+    audit::record(
+        config,
+        "restore_started",
+        serde_json::json!({"replace_empty": replace_empty}),
+    );
     let data = fs::read(snapshot_path(config)).context("no automux snapshot found")?;
     let snapshot: Snapshot = serde_json::from_slice(&data).context("invalid automux snapshot")?;
     if snapshot.version != FORMAT_VERSION {
@@ -180,9 +205,32 @@ pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
     }
     if restored > 0 {
         if let Some(name) = bootstrap {
+            if let Some(preferred) = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.attached && tmux::has_session(&session.name))
+                .or_else(|| {
+                    snapshot
+                        .sessions
+                        .iter()
+                        .find(|session| tmux::has_session(&session.name))
+                })
+            {
+                let _ = tmux::run(&["switch-client", "-t", &preferred.name]);
+                audit::record(
+                    config,
+                    "client_switched",
+                    serde_json::json!({"session": preferred.name}),
+                );
+            }
             let _ = tmux::run(&["kill-session", "-t", &name]);
         }
     }
+    audit::record(
+        config,
+        "restore_completed",
+        serde_json::json!({"restored_sessions": restored}),
+    );
     println!("restored {restored} session(s); existing sessions were left untouched");
     Ok(())
 }
@@ -265,6 +313,17 @@ fn restore_session(config: &Config, session: &Session) -> Result<()> {
                 &pane.cwd,
                 &startup_command(config, pane),
             ])?;
+            audit::record(
+                config,
+                "pane_launched",
+                serde_json::json!({
+                    "pane": pane_target,
+                    "saved_command": pane.current_command,
+                    "agent": pane.agent.as_ref().map(|agent| &agent.agent),
+                    "agent_session_id": pane.agent.as_ref().map(|agent| &agent.session_id),
+                    "nvim_session": pane.nvim_session,
+                }),
+            );
         }
         if let Some(active) = window.panes.iter().find(|p| p.active) {
             let pane_target = format!("{}.{}", target, active.index);
