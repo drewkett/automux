@@ -42,6 +42,8 @@ struct Pane {
     history_file: String,
     #[serde(default)]
     agent: Option<integrations::AgentSession>,
+    #[serde(default)]
+    nvim_session: Option<String>,
 }
 
 pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
@@ -81,6 +83,15 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
             .get(&row[2])
             .filter(|session| session.agent == current_command)
             .cloned();
+        let nvim_session = (current_command == "nvim")
+            .then(|| {
+                config
+                    .state_dir
+                    .join("nvim")
+                    .join(format!("pane-{pane_id}.vim"))
+            })
+            .filter(|path| path.is_file())
+            .map(|path| path.display().to_string());
         by_window
             .entry((row[0].clone(), row[1].parse()?))
             .or_default()
@@ -93,6 +104,7 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
                 active: row[7] == "1",
                 history_file,
                 agent,
+                nvim_session,
             });
     }
     let mut by_session: BTreeMap<String, Vec<Window>> = BTreeMap::new();
@@ -279,13 +291,22 @@ fn startup_command(config: &Config, pane: &Pane) -> String {
             }
             _ => None,
         });
+    let nvim_resume = pane.nvim_session.as_ref().and_then(|path| {
+        config
+            .resume_nvim
+            .then(|| format!("nvim -S {}", quote(path)))
+    });
     let fallback_resume = match pane.current_command.as_str() {
         "nvim" | "vim" if config.resume_nvim => Some("nvim -S Session.vim"),
         "claude" if config.resume_claude => Some("claude --continue"),
         "codex" if config.resume_codex => Some("codex resume --last"),
         _ => None,
     };
-    let shell = match exact_resume.as_deref().or(fallback_resume) {
+    let shell = match exact_resume
+        .as_deref()
+        .or(nvim_resume.as_deref())
+        .or(fallback_resume)
+    {
         Some(command) => format!("{command}; exec \"${{SHELL:-/bin/sh}}\" -l"),
         None => "exec \"${SHELL:-/bin/sh}\" -l".to_owned(),
     };

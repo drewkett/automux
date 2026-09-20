@@ -36,7 +36,7 @@ enum Command {
     Status,
     /// Print the resolved state directory (useful to plugin scripts).
     StateDir,
-    /// Install global session hooks for detected Claude Code and Codex CLIs.
+    /// Install global integrations for detected Neovim, Claude Code, and Codex.
     InstallHooks,
     /// Record the exact agent session associated with the current tmux pane.
     #[command(hide = true)]
