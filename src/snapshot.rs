@@ -189,7 +189,7 @@ pub fn restore(config: &Config, startup: bool) -> Result<()> {
                     .find(|session| tmux::has_session(&session.name))
             });
         if let Some(preferred) = preferred {
-            write_pending_attach(config, &server, &preferred.name);
+            write_pending_attach(&preferred.name);
         }
     }
     audit::record(
@@ -403,14 +403,12 @@ pub fn status(config: &Config) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PendingAttach {
-    server: String,
-    session: String,
-    /// When the restore ran; only a session tmux created after this can be the
-    /// throwaway one it made for the incoming client.
-    restored_at: u64,
-}
+/// Server option holding `<session><SEP><restore time>` between a startup
+/// restore and the first attach. It lives in the tmux server, so it can never
+/// outlive the server or leak into another one. The time matters because only
+/// a session tmux created after the restore can be the throwaway one it made
+/// for the incoming client.
+const PENDING_OPTION: &str = "@automux-pending-attach";
 
 /// Finish a startup restore once a client is actually attached.
 ///
@@ -419,49 +417,43 @@ struct PendingAttach {
 /// named itself (tmux numbers them from `0`) holding a single idle shell.
 pub fn attach(config: &Config) -> Result<()> {
     audit::record(config, "client-attached", serde_json::json!({}));
-    let Some(server) = tmux::server_identity() else {
+    let value = tmux::output(&["show-options", "-gqv", PENDING_OPTION]).unwrap_or_default();
+    let Some((session, restored_at)) = value.trim_end_matches('\n').split_once(SEP) else {
         return Ok(());
     };
-    let path = pending_attach_path(config, &server);
-    let Ok(data) = fs::read(&path) else {
-        return Ok(());
-    };
-    let pending: PendingAttach = serde_json::from_slice(&data)?;
-    if pending.server != server {
-        return Ok(());
-    }
+    let restored_at: u64 = restored_at.parse().context("invalid pending attach")?;
     // These hooks run detached, so `display-message` would report whichever
     // session tmux considers current rather than the one the client is in.
     let Some((client, current)) = first_client()? else {
         return Ok(());
     };
-    let skip = if !tmux::has_session(&pending.session) {
+    let skip = if !tmux::has_session(session) {
         Some("restored session is gone")
-    } else if current == pending.session {
+    } else if current == session {
         Some("already in the restored session")
     } else if current.parse::<u32>().is_err() {
         Some("client is in a session it was given a name")
-    } else if !created_after(&current, pending.restored_at) {
+    } else if !created_after(&current, restored_at) {
         Some("client's session predates the restore")
     } else if !empty_session(&current) {
         Some("client's session is in use")
     } else {
         None
     };
-    let _ = fs::remove_file(&path);
+    let _ = tmux::run(&["set-option", "-gu", PENDING_OPTION]);
     if let Some(reason) = skip {
         audit::record(
             config,
             "attach_skipped",
-            serde_json::json!({"session": pending.session, "current": current, "reason": reason}),
+            serde_json::json!({"session": session, "current": current, "reason": reason}),
         );
         return Ok(());
     }
-    tmux::run(&["switch-client", "-c", &client, "-t", &pending.session])?;
+    tmux::run(&["switch-client", "-c", &client, "-t", session])?;
     audit::record(
         config,
         "client_switched",
-        serde_json::json!({"session": pending.session, "replaced": current}),
+        serde_json::json!({"session": session, "replaced": current}),
     );
     let _ = tmux::run(&["kill-session", "-t", &current]);
     Ok(())
@@ -479,21 +471,9 @@ fn first_client() -> Result<Option<(String, String)>> {
     .map(|row| (row[0].clone(), row[1].clone())))
 }
 
-fn write_pending_attach(config: &Config, server: &str, session: &str) {
-    let pending = PendingAttach {
-        server: server.to_owned(),
-        session: session.to_owned(),
-        restored_at: now(),
-    };
-    if let Ok(data) = serde_json::to_vec(&pending) {
-        let _ = fs::write(pending_attach_path(config, &pending.server), data);
-    }
-}
-
-fn pending_attach_path(config: &Config, server: &str) -> PathBuf {
-    config
-        .state_dir
-        .join(format!("pending-attach-{}.json", tmux::socket_key(server)))
+fn write_pending_attach(session: &str) {
+    let value = format!("{session}{SEP}{}", now());
+    let _ = tmux::run(&["set-option", "-g", PENDING_OPTION, &value]);
 }
 
 /// Delete Neovim session files no pane refers to any more.
@@ -585,17 +565,9 @@ fn empty_session(name: &str) -> bool {
     if !single_window {
         return false;
     }
-    // Compare against the configured shell rather than a fixed list, so users
-    // of nushell or elvish are not excluded.
     let shell = default_shell();
     tmux::output(&["list-panes", "-t", name, "-F", "#{pane_current_command}"])
-        .map(|s| {
-            s.lines().count() == 1
-                && s.lines().all(|command| {
-                    matches!(command, "bash" | "zsh" | "fish" | "sh")
-                        || shell.as_deref() == Some(command)
-                })
-        })
+        .map(|s| s.lines().count() == 1 && s.lines().all(|c| at_login_shell(c, shell.as_deref())))
         .unwrap_or(false)
 }
 
