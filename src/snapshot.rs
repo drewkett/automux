@@ -1,8 +1,9 @@
 use crate::{
     audit,
     config::Config,
-    integrations::{self, Agent, AGENT_OPTION, NVIM_OPTION},
-    layout, tmux,
+    integrations::{self, AGENT_OPTION, NVIM_OPTION},
+    layout,
+    tmux::{self, SEP},
     util::{atomic_json, quote},
 };
 use anyhow::{bail, Context, Result};
@@ -14,9 +15,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// Version 2 labels panes through tmux pane options and embeds scrollback.
-const FORMAT_VERSION: u32 = 2;
-const SEP: &str = "\u{1f}";
+/// Version 3 stores a pane's agent as its `<agent>:<session id>` label.
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Snapshot {
@@ -46,7 +46,8 @@ struct Pane {
     active: bool,
     /// ANSI-formatted history, replayed into the restored pane.
     scrollback: String,
-    agent: Option<Agent>,
+    /// `<agent>:<session id>`, as the agent hooks label the pane.
+    agent: Option<String>,
     nvim_session: Option<String>,
 }
 
@@ -67,66 +68,85 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
     }
     let started = SystemTime::now();
     let shell = default_shell();
-    let sessions = tmux::lines(&[
-        "list-sessions",
-        "-F",
-        &format!("#{{session_name}}{SEP}#{{session_attached}}"),
-    ])?;
-    let windows = tmux::lines(&["list-windows", "-a", "-F", &format!("#{{session_name}}{SEP}#{{window_index}}{SEP}#{{window_name}}{SEP}#{{window_layout}}{SEP}#{{window_active}}")] )?;
-    let panes = tmux::lines(&["list-panes", "-a", "-F", &format!("#{{session_name}}{SEP}#{{window_index}}{SEP}#{{pane_id}}{SEP}#{{pane_index}}{SEP}#{{pane_current_path}}{SEP}#{{pane_current_command}}{SEP}#{{pane_title}}{SEP}#{{pane_active}}{SEP}#{{{AGENT_OPTION}}}{SEP}#{{{NVIM_OPTION}}}")] )?;
-
+    let panes = tmux::table(
+        &["list-panes", "-a"],
+        &[
+            "session_name",
+            "window_index",
+            "pane_id",
+            "pane_index",
+            "pane_current_path",
+            "pane_current_command",
+            "pane_title",
+            "pane_active",
+            AGENT_OPTION,
+            NVIM_OPTION,
+        ],
+    )?;
     let mut by_window: BTreeMap<(String, u32), Vec<Pane>> = BTreeMap::new();
     for row in panes {
-        if row.len() != 10 {
-            continue;
-        }
+        let [session, window, id, index, cwd, command, title, active, agent, nvim] = &row[..]
+        else {
+            unreachable!("tmux::table returns rows of the requested width")
+        };
         let scrollback = tmux::output(&[
             "capture-pane",
             "-epJ",
             "-S",
             &config.history_limit,
             "-t",
-            &row[2],
+            id,
         ])?;
         // The agent hooks and the Neovim plugin label a pane with what it runs
         // and clear the label on exit, but a crash skips that. A pane back at
         // the login shell is running neither, whatever its label says.
-        let running = !at_login_shell(&row[5], shell.as_deref());
+        let running = !at_login_shell(command, shell.as_deref());
+        let label = |value: &String| Some(value.clone()).filter(|v| running && !v.is_empty());
         by_window
-            .entry((row[0].clone(), row[1].parse()?))
+            .entry((session.clone(), window.parse()?))
             .or_default()
             .push(Pane {
-                index: row[3].parse()?,
-                cwd: row[4].clone(),
-                title: row[6].clone(),
-                active: row[7] == "1",
+                index: index.parse()?,
+                cwd: cwd.clone(),
+                title: title.clone(),
+                active: active == "1",
                 scrollback,
-                agent: Agent::parse(&row[8]).filter(|_| running),
-                nvim_session: Some(row[9].clone()).filter(|path| running && !path.is_empty()),
+                agent: label(agent),
+                nvim_session: label(nvim),
             });
     }
+    let windows = tmux::table(
+        &["list-windows", "-a"],
+        &[
+            "session_name",
+            "window_index",
+            "window_name",
+            "window_layout",
+            "window_active",
+        ],
+    )?;
     let mut by_session: BTreeMap<String, Vec<Window>> = BTreeMap::new();
     for row in windows {
-        if row.len() != 5 {
-            continue;
-        }
-        let index = row[1].parse()?;
-        by_session.entry(row[0].clone()).or_default().push(Window {
+        let [session, index, name, layout, active] = &row[..] else {
+            unreachable!("tmux::table returns rows of the requested width")
+        };
+        let index = index.parse()?;
+        by_session.entry(session.clone()).or_default().push(Window {
             index,
-            name: row[2].clone(),
-            layout: row[3].clone(),
-            active: row[4] == "1",
+            name: name.clone(),
+            layout: layout.clone(),
+            active: active == "1",
             panes: by_window
-                .remove(&(row[0].clone(), index))
+                .remove(&(session.clone(), index))
                 .unwrap_or_default(),
         });
     }
+    let sessions = tmux::table(&["list-sessions"], &["session_name", "session_attached"])?;
     let snapshot = Snapshot {
         version: FORMAT_VERSION,
         saved_at: now(),
         sessions: sessions
             .into_iter()
-            .filter(|r| r.len() == 2)
             .map(|r| Session {
                 name: r[0].clone(),
                 attached: r[1] != "0",
@@ -309,15 +329,9 @@ fn restore_session_with(
             ])?;
             // Codex does not run its SessionStart hook on resume, so label the
             // pane directly or the next snapshot would lose the session.
-            if let Some(agent) = resumed_agent(config, pane) {
-                let _ = server.run(&[
-                    "set-option",
-                    "-p",
-                    "-t",
-                    &pane_target,
-                    AGENT_OPTION,
-                    &agent.option_value(),
-                ]);
+            if let Some((agent, id)) = resumed_agent(config, pane) {
+                let label = format!("{agent}:{id}");
+                let _ = server.run(&["set-option", "-p", "-t", &pane_target, AGENT_OPTION, &label]);
             }
         }
         if let Some(active) = window.panes.iter().find(|p| p.active) {
@@ -335,16 +349,16 @@ fn restore_session_with(
     Ok(())
 }
 
-fn resumed_agent<'a>(config: &Config, pane: &'a Pane) -> Option<&'a Agent> {
-    pane.agent
-        .as_ref()
-        .filter(|agent| config.resumes(&agent.agent))
+/// The agent and session id to resume in a pane, if its agent is enabled.
+fn resumed_agent<'a>(config: &Config, pane: &'a Pane) -> Option<(&'a str, &'a str)> {
+    let (agent, id) = pane.agent.as_deref()?.split_once(':')?;
+    (config.resumes(agent) && !id.is_empty()).then_some((agent, id))
 }
 
 fn resume_command(config: &Config, pane: &Pane) -> Option<String> {
-    if let Some(agent) = resumed_agent(config, pane) {
-        let id = quote(&agent.session_id);
-        let command = match agent.agent.as_str() {
+    if let Some((agent, id)) = resumed_agent(config, pane) {
+        let id = quote(id);
+        let command = match agent {
             "codex" => format!("codex resume {id}"),
             _ => format!("claude --resume {id}"),
         };
@@ -461,14 +475,12 @@ pub fn attach(config: &Config) -> Result<()> {
 
 /// The first attached client and the session it is showing.
 fn first_client() -> Result<Option<(String, String)>> {
-    Ok(tmux::lines(&[
-        "list-clients",
-        "-F",
-        &format!("#{{client_name}}{SEP}#{{client_session}}"),
-    ])?
-    .into_iter()
-    .find(|row| row.len() == 2 && !row[0].is_empty() && !row[1].is_empty())
-    .map(|row| (row[0].clone(), row[1].clone())))
+    Ok(
+        tmux::table(&["list-clients"], &["client_name", "client_session"])?
+            .into_iter()
+            .find(|row| !row[0].is_empty() && !row[1].is_empty())
+            .map(|row| (row[0].clone(), row[1].clone())),
+    )
 }
 
 fn write_pending_attach(session: &str) {
@@ -780,10 +792,7 @@ mod tests {
     fn resume_commands_honour_the_configuration() {
         let (_temp, mut config) = config();
         let mut pane = pane(0);
-        pane.agent = Some(Agent {
-            agent: "codex".into(),
-            session_id: "abc'123".into(),
-        });
+        pane.agent = Some("codex:abc'123".into());
 
         assert!(!startup_command(&config, &pane, None).contains("codex resume"));
 
@@ -801,7 +810,7 @@ mod tests {
         config.resume = vec!["claude".into()];
         let server = FakeServer::new(0);
         let mut session = session(0);
-        session.windows[0].panes[0].agent = Agent::parse("claude:abc");
+        session.windows[0].panes[0].agent = Some("claude:abc".into());
 
         restore_session_with(&server, &config, &session).unwrap();
 

@@ -43,10 +43,21 @@ pub fn run(args: &[&str]) -> Result<()> {
     output(args).map(|_| ())
 }
 
-pub fn lines(args: &[&str]) -> Result<Vec<Vec<String>>> {
-    Ok(output(args)?
+/// Separates fields in tmux format output; it cannot appear in names.
+pub const SEP: &str = "\u{1f}";
+
+/// Run a tmux list command, returning one row per line holding the requested
+/// format `fields` in order. Rows with the wrong field count are dropped.
+pub fn table(args: &[&str], fields: &[&str]) -> Result<Vec<Vec<String>>> {
+    let format = fields
+        .iter()
+        .map(|field| format!("#{{{field}}}"))
+        .collect::<Vec<_>>()
+        .join(SEP);
+    Ok(output(&[args, &["-F", &format]].concat())?
         .lines()
-        .map(|line| line.split('\u{1f}').map(str::to_owned).collect())
+        .map(|line| line.split(SEP).map(str::to_owned).collect::<Vec<_>>())
+        .filter(|row| row.len() == fields.len())
         .collect())
 }
 

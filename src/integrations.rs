@@ -1,6 +1,6 @@
 use crate::{config::Config, tmux, util::atomic_json};
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     env, fs,
@@ -12,26 +12,6 @@ use std::{
 pub const AGENT_OPTION: &str = "@automux-agent";
 /// Pane option holding the path of the Neovim session file a pane keeps.
 pub const NVIM_OPTION: &str = "@automux-nvim";
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Agent {
-    pub agent: String,
-    pub session_id: String,
-}
-
-impl Agent {
-    pub fn parse(value: &str) -> Option<Self> {
-        let (agent, session_id) = value.trim().split_once(':')?;
-        (!agent.is_empty() && !session_id.is_empty()).then(|| Self {
-            agent: agent.to_owned(),
-            session_id: session_id.to_owned(),
-        })
-    }
-
-    pub fn option_value(&self) -> String {
-        format!("{}:{}", self.agent, self.session_id)
-    }
-}
 
 #[derive(Deserialize)]
 struct HookInput {
@@ -243,16 +223,6 @@ fn command_exists(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn agent_labels_round_trip() {
-        let agent = Agent::parse("codex:abc-123").unwrap();
-        assert_eq!(agent.agent, "codex");
-        assert_eq!(agent.session_id, "abc-123");
-        assert_eq!(agent.option_value(), "codex:abc-123");
-        assert_eq!(Agent::parse(""), None);
-        assert_eq!(Agent::parse("claude:"), None);
-    }
 
     #[test]
     fn merge_preserves_other_hooks_and_is_idempotent() {
