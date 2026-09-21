@@ -1,5 +1,9 @@
 # automux
 
+> **Note:** This project was written almost entirely by AI (Claude Code). It
+> works for my setup, but review the code yourself before trusting it with
+> your workspace.
+
 `automux` is a Rust-backed tmux plugin that continuously snapshots your tmux
 workspace and reconstructs it after tmux or the machine restarts.
 
