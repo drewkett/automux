@@ -7,9 +7,8 @@ pub struct Config {
     pub history_limit: String,
     pub debounce: Duration,
     pub restore_scrollback: bool,
-    pub resume_nvim: bool,
-    pub resume_claude: bool,
-    pub resume_codex: bool,
+    /// Programs to relaunch in restored panes: any of `nvim`, `claude`, `codex`.
+    pub resume: Vec<String>,
 }
 
 impl Config {
@@ -30,10 +29,12 @@ impl Config {
                 .unwrap_or_else(|| "-".into()),
             debounce: Duration::from_secs(options.u64("@automux-save-interval", 5)?),
             restore_scrollback: options.bool("@automux-restore-scrollback", true)?,
-            resume_nvim: options.bool("@automux-resume-nvim", false)?,
-            resume_claude: options.bool("@automux-resume-claude", false)?,
-            resume_codex: options.bool("@automux-resume-codex", false)?,
+            resume: options.list("@automux-resume", &["nvim", "claude", "codex"])?,
         })
+    }
+
+    pub fn resumes(&self, program: &str) -> bool {
+        self.resume.iter().any(|enabled| enabled == program)
     }
 }
 
@@ -73,6 +74,24 @@ impl Options {
             Some("0" | "off" | "no" | "false") => false,
             Some(value) => anyhow::bail!("invalid boolean for {name}: {value}"),
         })
+    }
+
+    /// A space- or comma-separated list drawn from `allowed`.
+    fn list(&self, name: &str, allowed: &[&str]) -> Result<Vec<String>> {
+        let value = self.get(name).unwrap_or_default();
+        value
+            .split([' ', ','])
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                if !allowed.contains(&word) {
+                    anyhow::bail!(
+                        "invalid value for {name}: {word}; expected {}",
+                        allowed.join(", ")
+                    );
+                }
+                Ok(word.to_owned())
+            })
+            .collect()
     }
 
     fn u64(&self, name: &str, default: u64) -> Result<u64> {
@@ -120,12 +139,18 @@ mod tests {
         assert_eq!(unquote("plain"), "plain");
 
         let options = options(&[
-            ("@automux-resume-nvim", "on"),
+            ("@automux-restore-scrollback", "on"),
+            ("@automux-resume", "nvim, codex"),
             ("@automux-save-interval", "12"),
             ("@automux-history-limit", ""),
         ]);
-        assert!(options.bool("@automux-resume-nvim", false).unwrap());
-        assert!(!options.bool("@automux-resume-codex", false).unwrap());
+        assert!(options.bool("@automux-restore-scrollback", false).unwrap());
+        assert!(!options.bool("@automux-missing", false).unwrap());
+        assert_eq!(
+            options.list("@automux-resume", &["nvim", "codex"]).unwrap(),
+            ["nvim", "codex"]
+        );
+        assert!(options.list("@automux-missing", &[]).unwrap().is_empty());
         assert_eq!(options.u64("@automux-save-interval", 5).unwrap(), 12);
         assert_eq!(options.u64("@automux-missing", 5).unwrap(), 5);
         assert_eq!(options.get("@automux-history-limit"), None);
@@ -134,10 +159,12 @@ mod tests {
     #[test]
     fn invalid_values_are_rejected() {
         let options = options(&[
-            ("@automux-resume-nvim", "maybe"),
+            ("@automux-restore-scrollback", "maybe"),
+            ("@automux-resume", "nvim emacs"),
             ("@automux-save-interval", "x"),
         ]);
-        assert!(options.bool("@automux-resume-nvim", false).is_err());
+        assert!(options.bool("@automux-restore-scrollback", false).is_err());
+        assert!(options.list("@automux-resume", &["nvim"]).is_err());
         assert!(options.u64("@automux-save-interval", 5).is_err());
     }
 }

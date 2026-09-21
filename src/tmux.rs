@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use std::{path::Path, process::Command};
+use std::process::Command;
 
 /// The tmux commands a restore issues.
 ///
@@ -51,13 +51,7 @@ pub fn lines(args: &[&str]) -> Result<Vec<Vec<String>>> {
 }
 
 pub fn has_session(name: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", name])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    output(&["has-session", "-t", name]).is_ok()
 }
 
 /// Identity of the tmux server this process belongs to, as
@@ -80,60 +74,17 @@ pub fn server_identity() -> Option<String> {
         .filter(|value| !value.is_empty() && value.contains(','))
 }
 
-/// Whether the tmux server that wrote a state directory is still alive.
+/// Stable, filesystem-safe key (FNV-1a) for the socket a server listens on.
 ///
-/// The socket is the stronger signal: tmux unlinks it when the server exits,
-/// and unlike the pid it cannot be recycled by an unrelated process. The pid
-/// check only narrows a live socket down further, and is treated as
-/// inconclusive when it cannot answer — `kill -0` fails with `EPERM` for a
-/// process owned by another user, which must not read as "dead".
-pub fn server_alive(identity: &str) -> bool {
-    let Some((socket, pid)) = identity.rsplit_once(',') else {
-        return false;
-    };
-    if !Path::new(socket).exists() {
-        return false;
-    }
-    // `has-session` against the socket proves a server is accepting
-    // connections there; anything less definite keeps the state.
-    Command::new("tmux")
-        .args(["-S", socket, "has-session"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(true)
-        || process_exists(pid)
-}
-
-fn process_exists(pid: &str) -> bool {
-    Command::new("kill")
-        .args(["-0", pid])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(true)
-}
-
-/// Stable, filesystem-safe key for the socket a server listens on.
-///
-/// Unlike [`server_key`], this deliberately ignores the pid, so it survives a
-/// restart of the server on the same socket. That is what state which has to
-/// outlive the server — the snapshot itself — is keyed by, while a second
-/// server on another `-L` socket still gets its own.
+/// It deliberately ignores the pid, so state keyed by it survives the server
+/// restart it exists to recover from, while a second server on another `-L`
+/// socket still gets its own.
 pub fn socket_key(identity: &str) -> String {
-    server_key(
-        identity
-            .rsplit_once(',')
-            .map_or(identity, |(socket, _)| socket),
-    )
-}
-
-/// Stable, filesystem-safe key for a server identity (FNV-1a).
-pub fn server_key(identity: &str) -> String {
+    let socket = identity
+        .rsplit_once(',')
+        .map_or(identity, |(socket, _)| socket);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in identity.as_bytes() {
+    for byte in socket.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
@@ -145,26 +96,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_keys_are_stable_and_distinct() {
-        let first = server_key("/tmp/tmux-502/default,14663");
-        assert_eq!(first, server_key("/tmp/tmux-502/default,14663"));
-        assert_ne!(first, server_key("/tmp/tmux-502/default,14664"));
-        assert_eq!(first.len(), 16);
-        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn socket_keys_ignore_the_server_pid() {
+    fn socket_keys_are_stable_and_ignore_the_server_pid() {
         let first = socket_key("/tmp/tmux-502/default,14663");
         assert_eq!(first, socket_key("/tmp/tmux-502/default,90001"));
         assert_ne!(first, socket_key("/tmp/tmux-502/other,14663"));
-    }
-
-    #[test]
-    fn a_dead_server_is_not_alive() {
-        // A socket path that cannot exist means the server is gone, whatever
-        // the pid says.
-        assert!(!server_alive("/nonexistent/automux-test/socket,4194304"));
-        assert!(!server_alive("no-comma"));
+        assert_eq!(first.len(), 16);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

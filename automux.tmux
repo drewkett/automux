@@ -15,11 +15,9 @@ tmux bind-key R run-shell -b "$BIN restore"
 tmux bind-key X confirm-before -p "Save workspace and stop tmux? (y/n)" \
   "run-shell '$BIN shutdown'"
 
-"$BIN" event plugin-loaded >/dev/null 2>&1 || true
-
 auto_restore="$(tmux show-option -gqv @automux-auto-restore)"
 if [[ "${auto_restore:-on}" == "on" ]]; then
-  "$BIN" restore --replace-empty >/dev/null 2>&1 || true
+  "$BIN" restore --startup >/dev/null 2>&1 || true
 fi
 
 # Install hooks after restore so reconstruction events cannot overwrite the

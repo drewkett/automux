@@ -1,19 +1,21 @@
 use crate::{
     audit,
     config::Config,
-    integrations, layout, process, tmux,
+    integrations::{self, Agent, AGENT_OPTION, NVIM_OPTION},
+    layout, tmux,
     util::{atomic_json, quote},
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const FORMAT_VERSION: u32 = 1;
+/// Version 2 labels panes through tmux pane options and embeds scrollback.
+const FORMAT_VERSION: u32 = 2;
 const SEP: &str = "\u{1f}";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,50 +40,47 @@ struct Window {
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Pane {
-    id: u64,
     index: u32,
     cwd: String,
-    current_command: String,
     title: String,
     active: bool,
-    history_file: String,
-    #[serde(default)]
-    agent: Option<integrations::AgentSession>,
-    #[serde(default)]
+    /// ANSI-formatted history, replayed into the restored pane.
+    scrollback: String,
+    agent: Option<Agent>,
     nvim_session: Option<String>,
 }
 
+impl Snapshot {
+    fn panes(&self) -> impl Iterator<Item = &Pane> {
+        self.sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+    }
+}
+
 pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
-    audit::record(config, "save_started", serde_json::json!({"force": force}));
     let server = tmux::server_identity().context("could not identify the tmux server")?;
     let path = snapshot_path(config, &server)?;
     if !force && recently_modified(&path, config.debounce) {
         return Ok(());
     }
-
-    integrations::prune_dead_servers(config, &server);
-    let history_dir = integrations::server_dir(config, "history", &server)?;
-    let history_prefix = relative_to(&config.state_dir, &history_dir);
-
-    let agents = integrations::registry(config).unwrap_or_default();
-    let nvim_panes = integrations::nvim_registry(config).unwrap_or_default();
-    let processes = process::Tree::capture();
+    let started = SystemTime::now();
+    let shell = default_shell();
     let sessions = tmux::lines(&[
         "list-sessions",
         "-F",
         &format!("#{{session_name}}{SEP}#{{session_attached}}"),
     ])?;
     let windows = tmux::lines(&["list-windows", "-a", "-F", &format!("#{{session_name}}{SEP}#{{window_index}}{SEP}#{{window_name}}{SEP}#{{window_layout}}{SEP}#{{window_active}}")] )?;
-    let panes = tmux::lines(&["list-panes", "-a", "-F", &format!("#{{session_name}}{SEP}#{{window_index}}{SEP}#{{pane_id}}{SEP}#{{pane_index}}{SEP}#{{pane_current_path}}{SEP}#{{pane_current_command}}{SEP}#{{pane_title}}{SEP}#{{pane_active}}{SEP}#{{pane_pid}}")] )?;
+    let panes = tmux::lines(&["list-panes", "-a", "-F", &format!("#{{session_name}}{SEP}#{{window_index}}{SEP}#{{pane_id}}{SEP}#{{pane_index}}{SEP}#{{pane_current_path}}{SEP}#{{pane_current_command}}{SEP}#{{pane_title}}{SEP}#{{pane_active}}{SEP}#{{{AGENT_OPTION}}}{SEP}#{{{NVIM_OPTION}}}")] )?;
 
     let mut by_window: BTreeMap<(String, u32), Vec<Pane>> = BTreeMap::new();
     for row in panes {
-        if row.len() != 9 {
+        if row.len() != 10 {
             continue;
         }
-        let pane_id = row[2].trim_start_matches('%').parse::<u64>()?;
-        let history_file = format!("{history_prefix}/pane-{pane_id}.ansi");
-        let capture = tmux::output(&[
+        let scrollback = tmux::output(&[
             "capture-pane",
             "-epJ",
             "-S",
@@ -89,51 +88,21 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
             "-t",
             &row[2],
         ])?;
-        fs::write(config.state_dir.join(&history_file), capture)?;
-        let pane_pid = row[8].parse::<u32>().ok();
-        let current_command = resolve_command(&row[5], pane_pid, processes.as_ref());
-        // Session hooks provide the authoritative application identity. Tmux
-        // may report the wrapper shell rather than the foreground TUI after a
-        // restored command, so process-name matching would lose exact IDs on
-        // the next save. Registry entries are scoped to this tmux server and
-        // removed by SessionEnd hooks.
-        // Automux also writes these records itself when it launches a resume,
-        // so a registration can outlive the process it describes. Drop one the
-        // pane is demonstrably no longer running; keep it when the process
-        // table is unavailable, since losing an ID is worse than keeping a
-        // stale one.
-        let agent =
-            agents
-                .get(&row[2])
-                .cloned()
-                .filter(|agent| match (processes.as_ref(), pane_pid) {
-                    (Some(tree), Some(pid)) => tree.runs(pid, &agent.agent),
-                    _ => true,
-                });
-        let nvim_session = (current_command == "nvim" || nvim_panes.contains(&row[2]))
-            .then(|| {
-                let path = config
-                    .state_dir
-                    .join("nvim")
-                    .join(tmux::server_key(&server))
-                    .join(format!("pane-{pane_id}.vim"));
-                path.is_file().then_some(path)
-            })
-            .flatten()
-            .map(|path| path.display().to_string());
+        // The agent hooks and the Neovim plugin label a pane with what it runs
+        // and clear the label on exit, but a crash skips that. A pane back at
+        // the login shell is running neither, whatever its label says.
+        let running = !at_login_shell(&row[5], shell.as_deref());
         by_window
             .entry((row[0].clone(), row[1].parse()?))
             .or_default()
             .push(Pane {
-                id: pane_id,
                 index: row[3].parse()?,
                 cwd: row[4].clone(),
-                current_command,
                 title: row[6].clone(),
                 active: row[7] == "1",
-                history_file,
-                agent,
-                nvim_session,
+                scrollback,
+                agent: Agent::parse(&row[8]).filter(|_| running),
+                nvim_session: Some(row[9].clone()).filter(|path| running && !path.is_empty()),
             });
     }
     let mut by_session: BTreeMap<String, Vec<Window>> = BTreeMap::new();
@@ -166,26 +135,7 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
             .collect(),
     };
     atomic_json(&path, &snapshot)?;
-    prune_history(&history_dir, &snapshot);
-    let agent_panes = snapshot
-        .sessions
-        .iter()
-        .flat_map(|session| &session.windows)
-        .flat_map(|window| &window.panes)
-        .filter(|pane| pane.agent.is_some())
-        .count();
-    let nvim_sessions = snapshot
-        .sessions
-        .iter()
-        .flat_map(|session| &session.windows)
-        .flat_map(|window| &window.panes)
-        .filter(|pane| pane.nvim_session.is_some())
-        .count();
-    audit::record(
-        config,
-        "save_completed",
-        serde_json::json!({"sessions": snapshot.sessions.len(), "agent_panes": agent_panes, "nvim_panes": nvim_sessions}),
-    );
+    prune_nvim_sessions(&integrations::nvim_dir(config, &server), &snapshot, started);
     if !quiet {
         println!(
             "saved {} session(s) to {}",
@@ -196,32 +146,14 @@ pub fn save(config: &Config, quiet: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
-    audit::record(
-        config,
-        "restore_started",
-        serde_json::json!({"replace_empty": replace_empty}),
-    );
+/// Restore every saved session that does not exist yet.
+///
+/// `startup` is set when the plugin loads with a new server. Plain `tmux`
+/// loads it before creating the session its client lands in, so there is
+/// nothing to switch yet; the attach hooks finish the job.
+pub fn restore(config: &Config, startup: bool) -> Result<()> {
     let server = tmux::server_identity().context("could not identify the tmux server")?;
-    let data = fs::read(snapshot_path(config, &server)?).context("no automux snapshot found")?;
-    let snapshot: Snapshot = serde_json::from_slice(&data).context("invalid automux snapshot")?;
-    if snapshot.version != FORMAT_VERSION {
-        bail!("unsupported snapshot version {}", snapshot.version);
-    }
-    let mut bootstrap = None;
-    if replace_empty {
-        if let Some(original) = current_session() {
-            if empty_session(&original) {
-                if snapshot.sessions.iter().any(|s| s.name == original) {
-                    let temporary = unique_bootstrap_name();
-                    tmux::run(&["rename-session", "-t", &original, &temporary])?;
-                    bootstrap = Some(temporary);
-                } else {
-                    bootstrap = Some(original);
-                }
-            }
-        }
-    }
+    let snapshot = load(config, &server)?;
     let mut restored = 0;
     let mut failed = 0;
     for session in &snapshot.sessions {
@@ -229,7 +161,7 @@ pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
             continue;
         }
         // One unrestorable session must not cost every session after it.
-        match restore_session(config, session) {
+        match restore_session_with(&tmux::Cli, config, session) {
             Ok(()) => restored += 1,
             Err(error) => {
                 failed += 1;
@@ -245,7 +177,7 @@ pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
             }
         }
     }
-    if restored > 0 {
+    if startup && restored > 0 {
         let preferred = snapshot
             .sessions
             .iter()
@@ -255,30 +187,9 @@ pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
                     .sessions
                     .iter()
                     .find(|session| tmux::has_session(&session.name))
-            })
-            .map(|session| session.name.clone());
-        match bootstrap {
-            Some(name) => {
-                if let Some(preferred) = &preferred {
-                    let _ = tmux::run(&["switch-client", "-t", preferred]);
-                    audit::record(
-                        config,
-                        "client_switched",
-                        serde_json::json!({"session": preferred}),
-                    );
-                }
-                let _ = tmux::run(&["kill-session", "-t", &name]);
-            }
-            // Plain `tmux` loads the plugin while the server is starting up,
-            // before any session or client exists, and only then runs the
-            // implicit `new-session`. There is nothing to switch yet, so the
-            // client would land in that brand new empty session instead of the
-            // restored one. Hand the switch to the `client-attached` hook.
-            None => {
-                if let Some(preferred) = preferred {
-                    write_pending_attach(config, &preferred);
-                }
-            }
+            });
+        if let Some(preferred) = preferred {
+            write_pending_attach(config, &server, &preferred.name);
         }
     }
     audit::record(
@@ -293,8 +204,14 @@ pub fn restore(config: &Config, replace_empty: bool) -> Result<()> {
     Ok(())
 }
 
-fn restore_session(config: &Config, session: &Session) -> Result<()> {
-    restore_session_with(&tmux::Cli, config, session)
+fn load(config: &Config, server: &str) -> Result<Snapshot> {
+    let data = fs::read(snapshot_path(config, server)?).context("no automux snapshot found")?;
+    let snapshot: Snapshot = serde_json::from_slice(&data)
+        .context("invalid automux snapshot (a snapshot from an older automux cannot be read)")?;
+    if snapshot.version != FORMAT_VERSION {
+        bail!("unsupported snapshot version {}", snapshot.version);
+    }
+    Ok(snapshot)
 }
 
 fn restore_session_with(
@@ -380,6 +297,7 @@ fn restore_session_with(
         // internal split sizes while sourcing a session file.
         for (pane, id) in window.panes.iter().zip(&ids) {
             let pane_target = format!("%{id}");
+            let scrollback = stage_scrollback(config, pane, *id)?;
             server.run(&[
                 "respawn-pane",
                 "-k",
@@ -387,22 +305,20 @@ fn restore_session_with(
                 &pane_target,
                 "-c",
                 &pane.cwd,
-                &startup_command(config, pane),
+                &startup_command(config, pane, scrollback.as_deref()),
             ])?;
-            if let Some(session) = exact_resume(config, pane) {
-                let _ = integrations::register_restored_agent(config, *id, session);
+            // Codex does not run its SessionStart hook on resume, so label the
+            // pane directly or the next snapshot would lose the session.
+            if let Some(agent) = resumed_agent(config, pane) {
+                let _ = server.run(&[
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &pane_target,
+                    AGENT_OPTION,
+                    &agent.option_value(),
+                ]);
             }
-            audit::record(
-                config,
-                "pane_launched",
-                serde_json::json!({
-                    "pane": pane_target,
-                    "saved_command": pane.current_command,
-                    "agent": pane.agent.as_ref().map(|agent| &agent.agent),
-                    "agent_session_id": pane.agent.as_ref().map(|agent| &agent.session_id),
-                    "nvim_session": pane.nvim_session,
-                }),
-            );
         }
         if let Some(active) = window.panes.iter().find(|p| p.active) {
             let pane_target = format!("{}.{}", target, active.index);
@@ -419,99 +335,70 @@ fn restore_session_with(
     Ok(())
 }
 
-/// What a pane is really running.
-///
-/// `pane_current_command` is only the pane's immediate foreground process, and
-/// it lies in two ways that matter here: a restored pane is wrapped in
-/// `sh -lc`, and Claude Code sets its process title to its version (e.g.
-/// `2.1.278`). The process tree already captured for this save answers both,
-/// so it is the primary source and tmux's answer is the fallback.
-fn resolve_command(command: &str, pane_pid: Option<u32>, tree: Option<&process::Tree>) -> String {
-    let resolved = match (tree, pane_pid) {
-        (Some(tree), Some(pid)) => tree.deepest_command(pid),
-        _ => None,
+fn resumed_agent<'a>(config: &Config, pane: &'a Pane) -> Option<&'a Agent> {
+    pane.agent
+        .as_ref()
+        .filter(|agent| config.resumes(&agent.agent))
+}
+
+fn resume_command(config: &Config, pane: &Pane) -> Option<String> {
+    if let Some(agent) = resumed_agent(config, pane) {
+        let id = quote(&agent.session_id);
+        let command = match agent.agent.as_str() {
+            "codex" => format!("codex resume {id}"),
+            _ => format!("claude --resume {id}"),
+        };
+        // Automux labelled the pane itself, so it clears the label too.
+        return Some(format!(
+            "{command}; tmux set-option -pu -t \"$TMUX_PANE\" {AGENT_OPTION}"
+        ));
+    }
+    let session = pane.nvim_session.as_ref()?;
+    config
+        .resumes("nvim")
+        .then(|| format!("nvim -S {}", quote(session)))
+}
+
+fn startup_command(config: &Config, pane: &Pane, scrollback: Option<&Path>) -> String {
+    let login = r#"exec "${SHELL:-/bin/sh}" -l"#;
+    let shell = match resume_command(config, pane) {
+        Some(command) => format!("{command}; {login}"),
+        None => login.to_owned(),
     };
-    match resolved {
-        // A version-like title still has to be named for `startup_command` and
-        // `nvim_session` to recognise it.
-        Some(found) if version_like(found) => "claude".to_owned(),
-        Some(found) => found.to_owned(),
-        None if version_like(command) => "claude".to_owned(),
-        None => command.to_owned(),
+    match scrollback {
+        Some(path) => {
+            let path = quote(&path.display().to_string());
+            format!(
+                "command cat -- {path}; rm -f -- {path}; exec sh -lc {}",
+                quote(&shell)
+            )
+        }
+        None => format!("exec sh -lc {}", quote(&shell)),
     }
 }
 
-fn version_like(command: &str) -> bool {
-    !command.is_empty()
-        && command.contains('.')
-        && command.chars().all(|c| c.is_ascii_digit() || c == '.')
-}
-
-/// The saved agent session a restored pane should be relaunched with, if
-/// resuming that agent is enabled.
-fn exact_resume<'a>(config: &Config, pane: &'a Pane) -> Option<&'a integrations::AgentSession> {
-    let session = pane.agent.as_ref()?;
-    match session.agent.as_str() {
-        "claude" if config.resume_claude => Some(session),
-        "codex" if config.resume_codex => Some(session),
-        _ => None,
+/// Write a pane's scrollback where its startup command prints and deletes it.
+fn stage_scrollback(config: &Config, pane: &Pane, id: u64) -> Result<Option<PathBuf>> {
+    if !config.restore_scrollback || pane.scrollback.is_empty() {
+        return Ok(None);
     }
-}
-
-fn startup_command(config: &Config, pane: &Pane) -> String {
-    let exact_resume = exact_resume(config, pane).map(|session| match session.agent.as_str() {
-        "codex" => format!("codex resume {}", quote(&session.session_id)),
-        _ => format!("claude --resume {}", quote(&session.session_id)),
-    });
-    let nvim_resume = pane.nvim_session.as_ref().and_then(|path| {
-        config
-            .resume_nvim
-            .then(|| format!("nvim -S {}", quote(path)))
-    });
-    let fallback_resume = match pane.current_command.as_str() {
-        "nvim" | "vim" if config.resume_nvim => Some("nvim -S Session.vim"),
-        "claude" if config.resume_claude => Some("claude --continue"),
-        "codex" if config.resume_codex => Some("codex resume --last"),
-        _ => None,
-    };
-    let shell = match exact_resume
-        .as_deref()
-        .or(nvim_resume.as_deref())
-        .or(fallback_resume)
-    {
-        Some(command) => format!("{command}; exec \"${{SHELL:-/bin/sh}}\" -l"),
-        None => "exec \"${SHELL:-/bin/sh}\" -l".to_owned(),
-    };
-    if config.restore_scrollback {
-        let history = config.state_dir.join(&pane.history_file);
-        format!(
-            "if [ -r {} ]; then command cat -- {}; fi; exec sh -lc {}",
-            quote(&history.display().to_string()),
-            quote(&history.display().to_string()),
-            quote(&shell)
-        )
-    } else {
-        format!("exec sh -lc {}", quote(&shell))
-    }
+    let directory = config.state_dir.join("scrollback");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{}-{id}.ansi", std::process::id()));
+    fs::write(&path, &pane.scrollback)?;
+    Ok(Some(path))
 }
 
 pub fn status(config: &Config) -> Result<()> {
     let server = tmux::server_identity().context("could not identify the tmux server")?;
-    let path = snapshot_path(config, &server)?;
-    let snapshot: Snapshot =
-        serde_json::from_slice(&fs::read(&path).context("no automux snapshot found")?)?;
+    let snapshot = load(config, &server)?;
     let windows: usize = snapshot.sessions.iter().map(|s| s.windows.len()).sum();
-    let panes: usize = snapshot
-        .sessions
-        .iter()
-        .flat_map(|s| &s.windows)
-        .map(|w| w.panes.len())
-        .sum();
     println!(
-        "{} session(s), {windows} window(s), {panes} pane(s); saved at Unix time {}\n{}",
+        "{} session(s), {windows} window(s), {} pane(s); saved at Unix time {}\n{}",
         snapshot.sessions.len(),
+        snapshot.panes().count(),
         snapshot.saved_at,
-        path.display()
+        snapshot_path(config, &server)?.display()
     );
     Ok(())
 }
@@ -592,12 +479,9 @@ fn first_client() -> Result<Option<(String, String)>> {
     .map(|row| (row[0].clone(), row[1].clone())))
 }
 
-fn write_pending_attach(config: &Config, session: &str) {
-    let Some(server) = tmux::server_identity() else {
-        return;
-    };
+fn write_pending_attach(config: &Config, server: &str, session: &str) {
     let pending = PendingAttach {
-        server,
+        server: server.to_owned(),
         session: session.to_owned(),
         restored_at: now(),
     };
@@ -612,46 +496,30 @@ fn pending_attach_path(config: &Config, server: &str) -> PathBuf {
         .join(format!("pending-attach-{}.json", tmux::socket_key(server)))
 }
 
-/// Delete scrollback captures for panes this server no longer has.
+/// Delete Neovim session files no pane refers to any more.
 ///
-/// `prune_dead_servers` only reclaims whole directories once a server exits,
-/// so without this a long-lived server keeps the full history of every pane it
-/// ever had.
-fn prune_history(history_dir: &Path, snapshot: &Snapshot) {
-    let live: std::collections::BTreeSet<u64> = snapshot
-        .sessions
-        .iter()
-        .flat_map(|session| &session.windows)
-        .flat_map(|window| &window.panes)
-        .map(|pane| pane.id)
+/// Files written since `started` are kept: their Neovim may have labelled its
+/// pane after the panes were listed.
+fn prune_nvim_sessions(directory: &Path, snapshot: &Snapshot, started: SystemTime) {
+    let live: BTreeSet<&std::ffi::OsStr> = snapshot
+        .panes()
+        .filter_map(|pane| Path::new(pane.nvim_session.as_deref()?).file_name())
         .collect();
-    let Ok(entries) = fs::read_dir(history_dir) else {
+    let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(id) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("pane-"))
-            .and_then(|name| name.strip_suffix(".ansi"))
-            .and_then(|id| id.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        if !live.contains(&id) {
-            let _ = fs::remove_file(entry.path());
+        let path = entry.path();
+        let stale = path.extension().is_some_and(|ext| ext == "vim")
+            && !live.contains(entry.file_name().as_os_str())
+            && entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| modified < started);
+        if stale {
+            let _ = fs::remove_file(path);
         }
     }
-}
-
-/// `path` expressed relative to `base`, using forward slashes.
-fn relative_to(base: &Path, path: &Path) -> String {
-    path.strip_prefix(base)
-        .unwrap_or(path)
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// Where this tmux server keeps its snapshot.
@@ -678,14 +546,6 @@ fn recently_modified(path: &Path, duration: std::time::Duration) -> bool {
         .map(|e| e < duration)
         .unwrap_or(false)
 }
-fn current_session() -> Option<String> {
-    tmux::output(&["display-message", "-p", "#{session_name}"])
-        .ok()
-        .map(|s| s.trim().into())
-}
-fn unique_bootstrap_name() -> String {
-    format!("__automux_bootstrap_{}", std::process::id())
-}
 /// Whether a session was created at or after `timestamp`.
 ///
 /// Missing or unparseable output reads as "no": killing a session the client
@@ -698,6 +558,25 @@ fn created_after(name: &str, timestamp: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Basename of tmux's `default-shell`.
+fn default_shell() -> Option<String> {
+    let value = tmux::output(&["display-message", "-p", "#{default-shell}"]).ok()?;
+    Path::new(value.trim())
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// Whether a pane's foreground command is the user's login shell.
+///
+/// A restored pane runs its program under an `sh -c` wrapper, which tmux
+/// reports instead of the program, so plain `sh` does not count.
+fn at_login_shell(command: &str, shell: Option<&str>) -> bool {
+    match shell {
+        Some(shell) => command == shell,
+        None => matches!(command, "bash" | "zsh" | "fish"),
+    }
+}
+
 /// A session holding nothing but one idle login shell in one window.
 fn empty_session(name: &str) -> bool {
     let single_window = tmux::output(&["list-windows", "-t", name, "-F", "#{window_id}"])
@@ -708,13 +587,7 @@ fn empty_session(name: &str) -> bool {
     }
     // Compare against the configured shell rather than a fixed list, so users
     // of nushell or elvish are not excluded.
-    let shell = tmux::output(&["display-message", "-p", "#{default-shell}"])
-        .ok()
-        .and_then(|value| {
-            Path::new(value.trim())
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        });
+    let shell = default_shell();
     tmux::output(&["list-panes", "-t", name, "-F", "#{pane_current_command}"])
         .map(|s| {
             s.lines().count() == 1
@@ -812,22 +685,18 @@ mod tests {
             history_limit: "-".into(),
             debounce: std::time::Duration::from_secs(5),
             restore_scrollback: false,
-            resume_nvim: false,
-            resume_claude: false,
-            resume_codex: false,
+            resume: Vec::new(),
         };
         (temp, config)
     }
 
-    fn pane(id: u64, index: u32) -> Pane {
+    fn pane(index: u32) -> Pane {
         Pane {
-            id,
             index,
             cwd: "/tmp".into(),
-            current_command: "zsh".into(),
             title: format!("pane {index}"),
             active: index == 0,
-            history_file: format!("history/k/pane-{id}.ansi"),
+            scrollback: "\x1b[1mhello\x1b[0m\n".into(),
             agent: None,
             nvim_session: None,
         }
@@ -843,14 +712,14 @@ mod tests {
                     name: "edit".into(),
                     layout: "aaaa,80x24,0,0,0".into(),
                     active: true,
-                    panes: vec![pane(0, 0)],
+                    panes: vec![pane(0)],
                 },
                 Window {
                     index: first_window + 1,
                     name: "run".into(),
                     layout: "bbbb,80x24,0,0{40x24,0,0,1,39x24,41,0,2}".into(),
                     active: false,
-                    panes: vec![pane(1, 0), pane(2, 1)],
+                    panes: vec![pane(0), pane(1)],
                 },
             ],
         }
@@ -915,67 +784,95 @@ mod tests {
         let mut server = FakeServer::new(0);
         server.lose_a_pane = true;
         let mut session = session(0);
-        session.windows[0].panes.push(pane(3, 1));
+        session.windows[0].panes.push(pane(1));
 
         let error = restore_session_with(&server, &config, &session).unwrap_err();
         assert!(error.to_string().contains("expected 2"), "{error}");
     }
 
     #[test]
-    fn startup_command_replays_scrollback_before_the_shell() {
+    fn staged_scrollback_is_replayed_then_removed() {
         let (_temp, mut config) = config();
         config.restore_scrollback = true;
-        let command = startup_command(&config, &pane(4, 0));
+        let pane = pane(0);
+        let path = stage_scrollback(&config, &pane, 4).unwrap().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), pane.scrollback);
 
-        assert!(command.starts_with("if [ -r "), "{command}");
-        assert!(command.contains("pane-4.ansi"), "{command}");
+        let command = startup_command(&config, &pane, Some(&path));
+        assert!(command.starts_with("command cat -- "), "{command}");
+        assert!(command.contains("rm -f -- "), "{command}");
         assert!(command.contains("exec sh -lc"), "{command}");
     }
 
     #[test]
     fn resume_commands_honour_the_configuration() {
         let (_temp, mut config) = config();
-        let mut pane = pane(5, 0);
-        pane.agent = Some(integrations::AgentSession {
+        let mut pane = pane(0);
+        pane.agent = Some(Agent {
             agent: "codex".into(),
             session_id: "abc'123".into(),
-            server: "/tmp/sock,1".into(),
         });
 
-        assert!(!startup_command(&config, &pane).contains("codex resume"));
+        assert!(!startup_command(&config, &pane, None).contains("codex resume"));
 
-        config.resume_codex = true;
-        let command = startup_command(&config, &pane);
+        config.resume = vec!["codex".into()];
+        let command = startup_command(&config, &pane, None);
         assert!(command.contains("codex resume"), "{command}");
+        assert!(command.contains(AGENT_OPTION), "{command}");
         // The session ID is quoted, so an embedded quote cannot break out.
         assert!(!command.contains("abc'123"), "{command}");
     }
 
     #[test]
-    fn resolve_command_prefers_the_process_tree() {
-        assert_eq!(resolve_command("sh", None, None), "sh");
-        assert_eq!(resolve_command("2.1.278", None, None), "claude");
+    fn restored_agents_are_labelled() {
+        let (_temp, mut config) = config();
+        config.resume = vec!["claude".into()];
+        let server = FakeServer::new(0);
+        let mut session = session(0);
+        session.windows[0].panes[0].agent = Agent::parse("claude:abc");
+
+        restore_session_with(&server, &config, &session).unwrap();
+
+        assert!(server.calls().contains(
+            &["set-option", "-p", "-t", "%0", AGENT_OPTION, "claude:abc"]
+                .map(String::from)
+                .to_vec()
+        ));
     }
 
     #[test]
-    fn stale_scrollback_files_are_removed() {
-        let (temp, _config) = config();
-        let history = temp.path().join("history");
-        fs::create_dir_all(&history).unwrap();
-        for name in ["pane-0.ansi", "pane-9.ansi", "notes.txt"] {
-            fs::write(history.join(name), "x").unwrap();
-        }
+    fn only_the_login_shell_counts_as_idle() {
+        assert!(at_login_shell("zsh", Some("zsh")));
+        // The wrapper a restored program runs under.
+        assert!(!at_login_shell("sh", Some("zsh")));
+        assert!(!at_login_shell("2.1.278", Some("zsh")));
+        assert!(at_login_shell("bash", None));
+    }
 
+    #[test]
+    fn unreferenced_nvim_sessions_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["1-1.vim", "2-2.vim", "notes.txt"] {
+            fs::write(temp.path().join(name), "x").unwrap();
+        }
+        let mut session = session(0);
+        session.windows[0].panes[0].nvim_session =
+            Some(temp.path().join("1-1.vim").display().to_string());
         let snapshot = Snapshot {
             version: FORMAT_VERSION,
             saved_at: 0,
-            sessions: vec![session(0)],
+            sessions: vec![session],
         };
-        prune_history(&history, &snapshot);
 
-        assert!(history.join("pane-0.ansi").exists());
-        assert!(!history.join("pane-9.ansi").exists());
+        // Files newer than the save are kept whatever the snapshot says.
+        prune_nvim_sessions(temp.path(), &snapshot, UNIX_EPOCH);
+        assert!(temp.path().join("2-2.vim").exists());
+
+        let later = SystemTime::now() + std::time::Duration::from_secs(60);
+        prune_nvim_sessions(temp.path(), &snapshot, later);
+        assert!(temp.path().join("1-1.vim").exists());
+        assert!(!temp.path().join("2-2.vim").exists());
         // Anything automux did not write is left alone.
-        assert!(history.join("notes.txt").exists());
+        assert!(temp.path().join("notes.txt").exists());
     }
 }
