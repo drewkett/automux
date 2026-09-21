@@ -147,3 +147,8 @@ Directories belonging to servers that have exited are removed on the next save.
 - Pane foreground command detection does not capture pipelines, environment
   variables, SSH connections, unsaved editor buffers, or arbitrary processes.
 - Sessions that already exist during restore are skipped to avoid data loss.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
